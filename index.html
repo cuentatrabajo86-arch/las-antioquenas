@@ -245,6 +245,10 @@ const $ = money => COP.format(Math.round(money||0));
 const prod = id => DB.productos.find(p=>p.id===id)||{};
 const combo = id => DB.combos.find(c=>c.id===id)||{};
 const cliente = id => DB.clientes.find(c=>c.id===id)||{nombre:'—'};
+const insumo = id => DB.insumos.find(i=>i.id===id)||{nombre:'—',unidad:'',stock:0,umbral:0,costo:0};
+const proveedor = id => DB.proveedores.find(v=>v.id===id)||{nombre:'—'};
+const insumosBajos = () => DB.insumos.filter(i=>i.stock<=i.umbral);
+function costoReceta(p){ if(!p.receta||!p.receta.length) return null; return p.receta.reduce((s,r)=>s+r.cantidad*insumo(r.insumoId).costo,0); }
 const esAdmin = () => S.user && S.user.rol==='admin';
 
 async function persist(){ await Store.save(DB); }
@@ -252,11 +256,11 @@ async function persist(){ await Store.save(DB); }
 function seed(){
   return {
     productos:[
-      {id:'p1',nombre:'Empanada',menudeo:1500,mayoreo:1300,costo:700,activo:true},
-      {id:'p2',nombre:'Papa rellena',menudeo:2500,mayoreo:2200,costo:1200,activo:true},
-      {id:'p3',nombre:'Arepa de huevo',menudeo:2000,mayoreo:1700,costo:900,activo:true},
-      {id:'p4',nombre:'Gaseosa',menudeo:2500,mayoreo:2200,costo:1500,activo:true},
-      {id:'p5',nombre:'Jugo natural',menudeo:3000,mayoreo:2600,costo:1400,activo:true},
+      {id:'p1',nombre:'Empanada',menudeo:1500,mayoreo:1300,costo:700,activo:true,receta:[]},
+      {id:'p2',nombre:'Papa rellena',menudeo:2500,mayoreo:2200,costo:1200,activo:true,receta:[]},
+      {id:'p3',nombre:'Arepa de huevo',menudeo:2000,mayoreo:1700,costo:900,activo:true,receta:[]},
+      {id:'p4',nombre:'Gaseosa',menudeo:2500,mayoreo:2200,costo:1500,activo:true,receta:[]},
+      {id:'p5',nombre:'Jugo natural',menudeo:3000,mayoreo:2600,costo:1400,activo:true,receta:[]},
     ],
     combos:[ {id:'c1',prodId:'p1',nombre:'Empanadas 10 + 2',gatillo:10,bono:2,activo:true} ],
     clientes:[
@@ -270,6 +274,9 @@ function seed(){
     jornada:null,       // jornada activa (abierta) o null
     historial:[],       // jornadas cerradas (inmutables)
     fiados:[],          // cuentas por cobrar
+    insumos:[],          // materias primas: {id,nombre,unidad,stock,umbral,costo}
+    proveedores:[],       // {id,nombre,contacto}
+    compras:[],           // {id,proveedorId,insumoId,cantidad,costoUnitario,fecha,ts}
     licencia:{activo:true,vence:null,url:'',lastCheck:0,maxDate:''},
     creatorPin:'2468',
   };
@@ -352,6 +359,8 @@ const I={
   warn:'<path d="M12 3l10 18H2z"/><path d="M12 9v5M12 18h.01"/>',
   chart:'<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
   plus:'<path d="M12 5v14M5 12h14"/>',
+  layers:'<path d="M12 3 2 8l10 5 10-5z"/><path d="M2 13l10 5 10-5"/>',
+  truck:'<rect x="1" y="7" width="14" height="10" rx="1"/><path d="M15 10h4l3 3v4h-7z"/><circle cx="6" cy="19" r="1.6"/><circle cx="17" cy="19" r="1.6"/>',
   empty:'<circle cx="12" cy="12" r="9"/><path d="M8 13a4 4 0 0 0 8 0"/>',
 };
 const svg = k => `<svg viewBox="0 0 24 24" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${I[k]}</svg>`;
@@ -400,11 +409,17 @@ function viewRouter(){
 }
 
 /* ------------------------------- INICIO / DÍA ------------------------------- */
+function alertaInsumos(){
+  if(!esAdmin()) return '';
+  const bajos=insumosBajos(); if(!bajos.length) return '';
+  return `<div class="warnbox" onclick="App.go('ajustes');App.sub('ins')" style="cursor:pointer">${svg('warn')} ${bajos.length} insumo${bajos.length>1?'s':''} con stock bajo — toca para revisar</div>`;
+}
 function vInicio(){
   const j=DB.jornada;
   if(!j){
     return `<div class="view-title">Buen día</div>
       <div class="view-sub">No hay un día abierto todavía.</div>
+      ${alertaInsumos()}
       <div class="card"><h3>Empieza la jornada</h3>
         <p style="color:var(--tinta-soft);font-size:13px;margin-bottom:16px">Registra la entrega de la mañana para arrancar a vender.</p>
         <button class="btn btn-primary" onclick="App.go('abrir')">${svg('plus')} Abrir el día</button>
@@ -417,6 +432,7 @@ function vInicio(){
   const fiadoHoy = j.mayoreo.filter(m=>m.estado==='fiado').reduce((s,m)=>s+m.qty*m.precio,0);
   return `<div class="view-title">Día abierto</div>
     <div class="view-sub">${fmtFecha(j.fecha)} · atiende ${nombreUsuario(j.trabajadorId)}</div>
+    ${alertaInsumos()}
     <div class="card hero">
       <h3>Entregado esta mañana</h3>
       <div class="big">${entregadoU} <span style="font-size:18px;font-weight:600">und</span></div>
@@ -540,15 +556,73 @@ function vForm(){
   }
   if(t==='prodedit'){
     const id=S.ctx.editId; const p=id?prod(id):{nombre:'',menudeo:'',mayoreo:'',costo:''};
+    if(!S.ctx.receta) S.ctx.receta=(p.receta||[]).map(r=>({...r}));
+    const rec=S.ctx.receta; const rc=rec.length?rec.reduce((s,r)=>s+r.cantidad*insumo(r.insumoId).costo,0):null;
+    const filasReceta=rec.map((r,idx)=>`<div class="qr"><div class="nm">${insumo(r.insumoId).nombre}<small>${r.cantidad} ${insumo(r.insumoId).unidad} por unidad</small></div>
+      <button class="btn btn-sm btn-line" onclick="App.quitarInsumoReceta(${idx})">Quitar</button></div>`).join('');
     return `<div class="view-title">${id?'Editar producto':'Nuevo producto'}</div><div class="view-sub">Solo el administrador cambia productos y precios.</div>
       <div class="card">
         <label class="fld"><span>Nombre</span><input type="text" id="p_nom" value="${p.nombre||''}" placeholder="Ej. Empanada"></label>
         <label class="fld"><span>Precio menudeo (por unidad)</span><input type="number" min="0" inputmode="numeric" id="p_men" value="${p.menudeo||''}" placeholder="0"></label>
         <label class="fld"><span>Precio mayoreo (por unidad)</span><input type="number" min="0" inputmode="numeric" id="p_may" value="${p.mayoreo||''}" placeholder="0"></label>
-        <label class="fld"><span>Costo (lo que te cuesta)</span><input type="number" min="0" inputmode="numeric" id="p_cos" value="${p.costo||''}" placeholder="0"></label>
+        <label class="fld"><span>Costo (lo que te cuesta)</span><input type="number" min="0" inputmode="numeric" id="p_cos" value="${rc!=null?Math.round(rc):(p.costo||'')}" ${rc!=null?'disabled':''}></label>
+        ${rc!=null?`<div class="hint">Se calcula solo con la receta de abajo.</div>`:''}
+      </div>
+      <div class="card"><h3>Receta (opcional)</h3>
+        ${rec.length?`<div class="qtygrid">${filasReceta}</div>`:`<div class="hint" style="margin-bottom:10px">Sin receta: el costo queda manual, como arriba.</div>`}
+        ${DB.insumos.length?`<div style="display:flex;gap:8px;margin-top:${rec.length?'12px':'0'}">
+          <select id="p_insIns" style="flex:1">${DB.insumos.map(i=>`<option value="${i.id}">${i.nombre}</option>`).join('')}</select>
+          <input type="number" min="0" step="any" id="p_insQty" placeholder="Cant." style="width:88px">
+          <button class="btn btn-sm btn-ghost" style="width:auto" onclick="App.agregarInsumoReceta()">+ Agregar</button>
+        </div>`:`<div class="hint">Crea insumos primero en Ajustes → Insumos para armar la receta.</div>`}
       </div>
       <button class="btn btn-primary" onclick="App.saveProd()">Guardar producto</button>
       ${id?`<div style="height:8px"></div><button class="btn btn-danger" onclick="App.delProd('${id}')">Eliminar producto</button>`:''}${backAj}`;
+  }
+  if(t==='insedit'){
+    const id=S.ctx.editId; const i=id?insumo(id):{nombre:'',unidad:'g',stock:'',umbral:'',costo:''};
+    return `<div class="view-title">${id?'Editar insumo':'Nuevo insumo'}</div><div class="view-sub">Materia prima: harina, papa, aceite, gas…</div>
+      <div class="card">
+        <label class="fld"><span>Nombre</span><input type="text" id="i_nom" value="${i.nombre||''}" placeholder="Ej. Harina de trigo"></label>
+        <label class="fld"><span>Unidad</span><select id="i_uni">${['g','kg','ml','l','unidad'].map(u=>`<option value="${u}" ${i.unidad===u?'selected':''}>${u}</option>`).join('')}</select></label>
+        <label class="fld"><span>Stock actual</span><input type="number" min="0" step="any" id="i_sto" value="${i.stock??''}" placeholder="0"></label>
+        <label class="fld"><span>Alerta cuando el stock baje de</span><input type="number" min="0" step="any" id="i_umb" value="${i.umbral??''}" placeholder="0"></label>
+        <label class="fld"><span>Costo por unidad</span><input type="number" min="0" step="any" id="i_cos" value="${i.costo??''}" placeholder="0"></label>
+      </div>
+      <button class="btn btn-primary" onclick="App.saveInsumo()">Guardar insumo</button>
+      ${id?`<div style="height:8px"></div><button class="btn btn-danger" onclick="App.delInsumo('${id}')">Eliminar insumo</button>`:''}${backAj}`;
+  }
+  if(t==='provedit'){
+    const id=S.ctx.editId; const v=id?proveedor(id):{nombre:'',contacto:''};
+    return `<div class="view-title">${id?'Editar proveedor':'Nuevo proveedor'}</div><div class="view-sub">A quien le compras los insumos.</div>
+      <div class="card">
+        <label class="fld"><span>Nombre</span><input type="text" id="v_nom" value="${v.nombre||''}" placeholder="Ej. Molino El Trigal"></label>
+        <label class="fld"><span>Contacto (opcional)</span><input type="text" id="v_con" value="${v.contacto||''}" placeholder="Telefono"></label>
+      </div>
+      <button class="btn btn-primary" onclick="App.saveProv()">Guardar proveedor</button>
+      ${id?`<div style="height:8px"></div><button class="btn btn-danger" onclick="App.delProv('${id}')">Eliminar proveedor</button>`:''}${backAj}`;
+  }
+  if(t==='compra'){
+    if(!DB.proveedores.length) return `<div class="view-title">Registrar compra</div><div class="empty">${svg('empty')}<div>Necesitas al menos un proveedor creado.</div></div><div style="height:8px"></div><button class="btn btn-line" onclick="App.volverAjustes('prov')">Volver</button>`;
+    const tipo=S.ctx.compraTipo||'insumo';
+    return `<div class="view-title">Registrar compra</div><div class="view-sub">Materia prima para recetas, o producto ya listo para revender (gaseosas, avena, jugos…).</div>
+      <div class="card">
+        <label class="fld"><span>Que compraste</span>
+          <select id="co_tipo" onchange="App.compraTipoChange()">
+            <option value="insumo" ${tipo==='insumo'?'selected':''}>Insumo (materia prima, para receta)</option>
+            <option value="producto" ${tipo==='producto'?'selected':''}>Producto para reventa (ya viene hecho)</option>
+          </select>
+        </label>
+        <label class="fld"><span>Proveedor</span><select id="co_prov">${DB.proveedores.map(v=>`<option value="${v.id}">${v.nombre}</option>`).join('')}</select></label>
+        ${tipo==='insumo'
+          ? (DB.insumos.length?`<label class="fld"><span>Insumo</span><select id="co_ins">${DB.insumos.map(i=>`<option value="${i.id}">${i.nombre} (${i.unidad})</option>`).join('')}</select></label>`:`<div class="hint">No tienes insumos creados aun — creas uno en Ajustes → Insumos, o cambia arriba a "Producto para reventa".</div>`)
+          : `<label class="fld"><span>Producto</span><select id="co_prod">${DB.productos.filter(p=>p.activo).map(p=>`<option value="${p.id}">${p.nombre}</option>`).join('')}</select></label>`}
+        <label class="fld"><span>Cantidad</span><input type="number" min="0" step="any" id="co_qty" placeholder="0"></label>
+        <label class="fld"><span>Costo unitario pagado</span><input type="number" min="0" step="any" id="co_cos" placeholder="0"></label>
+        ${tipo==='producto'?`<div class="hint">Esto actualiza el costo del producto al ultimo precio pagado — no toca la entrega del dia.</div>`:''}
+      </div>
+      <button class="btn btn-primary" onclick="App.saveCompra()">Registrar compra</button>
+      <div style="height:8px"></div><button class="btn btn-line" onclick="App.volverAjustes('prov')">Cancelar</button>`;
   }
   if(t==='cliedit'){
     const id=S.ctx.editId; const c=id?cliente(id):{nombre:'',contacto:''};
@@ -650,6 +724,7 @@ function vInforme(){
       <div class="row"><div class="lab">Transferencia / Nequi</div><div class="val">${$(j.cierre.transfer)}</div></div>
     </div>`:''}
     ${tot.inconsistencia?`<div class="warnbox">${svg('warn')} Ojo: en algún producto se registró más de lo que salió. Revisa las cantidades.</div>`:''}
+    ${barraGanancias(tot)}
     <div class="statgrid">
       <div class="stat pos"><b>${$(tot.gananciaNeta)}</b><span>Ganancia del día</span></div>
       <div class="stat"><b>${$(tot.ventasTotales)}</b><span>Ventas totales</span></div>
@@ -666,6 +741,23 @@ function vInforme(){
       <div class="row"><div class="lab">Valor regalado</div><div class="val">${$(totalRegVal)}</div></div>
     </div>
     ${back}`;
+}
+function barraGanancias(tot){
+  const ganado=Math.max(0,tot.gananciaNeta), enCalle=Math.max(0,tot.ingMayoreoFiado), perdido=Math.max(0,tot.costoMerma+tot.costoRegalo);
+  const total=ganado+enCalle+perdido; if(total<=0) return '';
+  const pg=Math.round(ganado/total*1000)/10, pc=Math.round(enCalle/total*1000)/10, pp=Math.max(0,100-pg-pc);
+  return `<div class="card"><h3>De un vistazo</h3>
+    <div style="display:flex;height:14px;border-radius:8px;overflow:hidden;background:var(--surface2)">
+      ${pg>0?`<div style="width:${pg}%;background:var(--emerald)"></div>`:''}
+      ${pc>0?`<div style="width:${pc}%;background:var(--gold)"></div>`:''}
+      ${pp>0?`<div style="width:${pp}%;background:var(--coral)"></div>`:''}
+    </div>
+    <div style="display:flex;justify-content:space-between;margin-top:14px;gap:8px">
+      <div><div class="val" style="color:var(--emerald)">${$(ganado)}</div><div class="sub">Ganado</div></div>
+      <div style="text-align:center"><div class="val" style="color:var(--gold-bright)">${$(enCalle)}</div><div class="sub">En la calle</div></div>
+      <div style="text-align:right"><div class="val" style="color:var(--coral)">${$(perdido)}</div><div class="sub">Perdido</div></div>
+    </div>
+  </div>`;
 }
 function drawChart(ranking){
   const el=document.getElementById('chart'); if(!el||!window.Chart) return;
@@ -716,11 +808,41 @@ function vAjustes(){
       <button class="tile" onclick="App.sub('cli')"><div class="ico">${svg('users')}</div><b>Clientes</b><span>Para el mayoreo</span></button>
       <button class="tile" onclick="App.sub('emp')"><div class="ico">${svg('users')}</div><b>Empleados</b><span>Accesos y PIN</span></button>
       <button class="tile" onclick="App.sub('hist')"><div class="ico">${svg('clock')}</div><b>Historial</b><span>Días cerrados</span></button>
+      <button class="tile aji" onclick="App.sub('ins')"><div class="ico">${svg('layers')}</div><b>Insumos</b><span>${insumosBajos().length?insumosBajos().length+' con stock bajo':'Materia prima'}</span></button>
+      <button class="tile hoja" onclick="App.sub('prov')"><div class="ico">${svg('truck')}</div><b>Proveedores</b><span>Compras</span></button>
     </div>
     ${S.sub==='prod'?panelProductos():''}
     ${S.sub==='combo'?panelCombos():''}
     ${S.sub==='cli'?panelClientes():''}
-    ${S.sub==='emp'?panelEmpleados():''}`;
+    ${S.sub==='emp'?panelEmpleados():''}
+    ${S.sub==='ins'?panelInsumos():''}
+    ${S.sub==='prov'?panelProveedores():''}`;
+}
+function panelInsumos(){
+  return `<div class="seclabel">Insumos</div>${DB.insumos.map(i=>{
+    const bajo=i.stock<=i.umbral;
+    return `<div class="card"><div class="row" style="border:none">
+      <div style="display:flex;align-items:center;gap:9px"><span class="sem ${bajo?'bad':'ok'}"></span>
+      <div><div class="lab">${i.nombre}</div><div class="sub">Minimo ${i.umbral} ${i.unidad} · Costo ${$(i.costo)}/${i.unidad}</div></div></div>
+      <div style="text-align:right"><div class="val" style="${bajo?'color:var(--coral)':''}">${i.stock} ${i.unidad}</div>
+      <button class="btn btn-sm btn-line" onclick="App.editInsumo('${i.id}')">Editar</button></div></div></div>`;
+  }).join('')||'<div class="empty">Sin insumos creados.</div>'}
+    <button class="btn btn-ghost" onclick="App.editInsumo(null)">${svg('plus')} Nuevo insumo</button>`;
+}
+function panelProveedores(){
+  const comprasOrd=[...DB.compras].sort((a,b)=>b.ts-a.ts).slice(0,15);
+  return `<div class="seclabel">Proveedores</div>${DB.proveedores.map(v=>`
+    <div class="card"><div class="row" style="border:none">
+      <div><div class="lab">${v.nombre}</div><div class="sub">${v.contacto||'sin contacto'}</div></div>
+      <button class="btn btn-sm btn-line" onclick="App.editProv('${v.id}')">Editar</button></div></div>`).join('')||'<div class="empty">Sin proveedores.</div>'}
+    <button class="btn btn-ghost" onclick="App.editProv(null)">${svg('plus')} Nuevo proveedor</button>
+    <div style="height:8px"></div>
+    <button class="btn btn-primary" onclick="App.form('compra')">${svg('truck')} Registrar compra</button>
+    ${comprasOrd.length?`<div class="seclabel">Compras recientes</div><div class="card">${comprasOrd.map(c=>{
+      const esProd=c.tipo==='producto'; const item=esProd?prod(c.prodId):insumo(c.insumoId);
+      return `<div class="row"><div><div class="lab">${c.cantidad}${esProd?' und':' '+item.unidad} · ${item.nombre}${esProd?' <span class="pill g">reventa</span>':''}</div><div class="sub">${proveedor(c.proveedorId).nombre} · ${fmtFecha(c.fecha)}</div></div>
+      <div class="val">${$(c.cantidad*c.costoUnitario)}</div></div>`;
+    }).join('')}</div>`:''}`;
 }
 function panelProductos(){
   return `<div class="seclabel">Productos</div>${DB.productos.map(p=>`
@@ -823,6 +945,10 @@ const App = {
     const entregas={}; let algo=false;
     DB.productos.filter(p=>p.activo).forEach(p=>{const v=parseInt(document.getElementById('ent_'+p.id).value)||0; if(v>0){entregas[p.id]=v;algo=true;}});
     if(!algo){ toast('Ingresa al menos una cantidad'); return; }
+    // Consumo de insumos: se descuenta al producir (entrega de la mañana), no venta por venta
+    Object.entries(entregas).forEach(([pid,qty])=>{
+      const p=prod(pid); if(p.receta&&p.receta.length){ p.receta.forEach(r=>{ const ins=insumo(r.insumoId); if(ins.id) ins.stock=Math.round((ins.stock-r.cantidad*qty)*1000)/1000; }); }
+    });
     DB.jornada={id:uid(),fecha:today(),trabajadorId:S.user.id,estado:'abierta',entregas,mayoreo:[],combos:[],mermas:[],gastos:[],cierre:null};
     await persist(); App.go('inicio'); toast('Día abierto');
   },
@@ -976,19 +1102,78 @@ const App = {
     if(sel){ sel.innerHTML=DB.clientes.map(c=>`<option value="${c.id}">${c.nombre}</option>`).join(''); sel.value=id; }
     toast('Cliente agregado');
   },
+  agregarInsumoReceta(){
+    const sel=document.getElementById('p_insIns'), q=parseFloat(document.getElementById('p_insQty').value);
+    if(!sel||!q||q<=0){ toast('Escribe una cantidad valida'); return; }
+    if(!S.ctx.receta) S.ctx.receta=[];
+    const ex=S.ctx.receta.find(r=>r.insumoId===sel.value);
+    if(ex) ex.cantidad=q; else S.ctx.receta.push({insumoId:sel.value,cantidad:q});
+    render();
+  },
+  quitarInsumoReceta(idx){ S.ctx.receta.splice(idx,1); render(); },
   async saveProd(){
     const id=S.ctx.editId;
     const nombre=document.getElementById('p_nom').value.trim();
     const menudeo=parseInt(document.getElementById('p_men').value)||0;
     const mayoreo=parseInt(document.getElementById('p_may').value)||0;
-    const costo=parseInt(document.getElementById('p_cos').value)||0;
+    const receta=S.ctx.receta||[];
+    const rc=costoReceta({receta});
+    const costo=rc!=null?Math.round(rc):(parseInt(document.getElementById('p_cos').value)||0);
     if(!nombre){ toast('Ponle nombre al producto'); return; }
     if(menudeo<1){ toast('El precio de menudeo es obligatorio'); return; }
-    if(id) Object.assign(prod(id),{nombre,menudeo,mayoreo,costo});
-    else DB.productos.push({id:uid(),nombre,menudeo,mayoreo,costo,activo:true});
+    if(id) Object.assign(prod(id),{nombre,menudeo,mayoreo,costo,receta});
+    else DB.productos.push({id:uid(),nombre,menudeo,mayoreo,costo,receta,activo:true});
+    S.ctx={};
     await persist(); App.volverAjustes('prod'); toast('Producto guardado');
   },
   async delProd(id){ if(!confirm('¿Eliminar este producto?')) return; DB.productos=DB.productos.filter(p=>p.id!==id); await persist(); App.volverAjustes('prod'); toast('Producto eliminado'); },
+  async editInsumo(id){ S.ctx={editId:id||null}; S.view='form'; S.sub='insedit'; render(); window.scrollTo(0,0); },
+  async saveInsumo(){
+    const id=S.ctx.editId;
+    const nombre=document.getElementById('i_nom').value.trim();
+    const unidad=document.getElementById('i_uni').value;
+    const stock=parseFloat(document.getElementById('i_sto').value)||0;
+    const umbral=parseFloat(document.getElementById('i_umb').value)||0;
+    const costo=parseFloat(document.getElementById('i_cos').value)||0;
+    if(!nombre){ toast('Ponle nombre al insumo'); return; }
+    if(id) Object.assign(insumo(id),{nombre,unidad,stock,umbral,costo});
+    else DB.insumos.push({id:uid(),nombre,unidad,stock,umbral,costo});
+    await persist(); App.volverAjustes('ins'); toast('Insumo guardado');
+  },
+  async delInsumo(id){ if(!confirm('¿Eliminar este insumo? Si esta en una receta, esa receta quedara incompleta.')) return; DB.insumos=DB.insumos.filter(i=>i.id!==id); await persist(); App.volverAjustes('ins'); toast('Insumo eliminado'); },
+  async editProv(id){ S.ctx={editId:id||null}; S.view='form'; S.sub='provedit'; render(); window.scrollTo(0,0); },
+  async saveProv(){
+    const id=S.ctx.editId;
+    const nombre=document.getElementById('v_nom').value.trim();
+    const contacto=document.getElementById('v_con').value.trim();
+    if(!nombre){ toast('Ponle nombre al proveedor'); return; }
+    if(id) Object.assign(proveedor(id),{nombre,contacto});
+    else DB.proveedores.push({id:uid(),nombre,contacto});
+    await persist(); App.volverAjustes('prov'); toast('Proveedor guardado');
+  },
+  async delProv(id){ if(!confirm('¿Eliminar este proveedor?')) return; DB.proveedores=DB.proveedores.filter(v=>v.id!==id); await persist(); App.volverAjustes('prov'); toast('Proveedor eliminado'); },
+  compraTipoChange(){ S.ctx.compraTipo=document.getElementById('co_tipo').value; render(); },
+  async saveCompra(){
+    const tipo=S.ctx.compraTipo||'insumo';
+    const proveedorId=document.getElementById('co_prov').value;
+    const cantidad=parseFloat(document.getElementById('co_qty').value)||0;
+    const costoUnitario=parseFloat(document.getElementById('co_cos').value)||0;
+    if(cantidad<=0||costoUnitario<=0){ toast('Revisa cantidad y costo'); return; }
+    if(tipo==='insumo'){
+      const insumoId=document.getElementById('co_ins').value;
+      const ins=insumo(insumoId);
+      const stockAnt=ins.stock||0, costoAnt=ins.costo||0;
+      ins.stock=Math.round((stockAnt+cantidad)*1000)/1000;
+      ins.costo=Math.round(((stockAnt*costoAnt+cantidad*costoUnitario)/(stockAnt+cantidad))*100)/100;
+      DB.compras.push({id:uid(),tipo:'insumo',proveedorId,insumoId,cantidad,costoUnitario,fecha:today(),ts:Date.now()});
+    } else {
+      const prodId=document.getElementById('co_prod').value;
+      prod(prodId).costo=Math.round(costoUnitario);
+      DB.compras.push({id:uid(),tipo:'producto',proveedorId,prodId,cantidad,costoUnitario,fecha:today(),ts:Date.now()});
+    }
+    S.ctx={};
+    await persist(); App.volverAjustes('prov'); toast('Compra registrada');
+  },
   async saveCli(){
     const id=S.ctx.editId;
     const nombre=document.getElementById('c_nom').value.trim();
@@ -1115,6 +1300,9 @@ function bindCreator(){}
 /* ================================ BOOT ================================ */
 function sanea(){
   DB.fiados=DB.fiados||[]; DB.historial=DB.historial||[]; DB.combos=DB.combos||[];
+  DB.insumos=DB.insumos||[]; DB.proveedores=DB.proveedores||[]; DB.compras=DB.compras||[];
+  DB.compras.forEach(c=>{ if(!c.tipo) c.tipo='insumo'; });
+  DB.productos.forEach(p=>{ if(!p.receta) p.receta=[]; });
   DB.licencia=DB.licencia||{activo:true,vence:null,url:'',lastCheck:0,maxDate:''};
   DB.creatorPin=DB.creatorPin||'2468';
 }
