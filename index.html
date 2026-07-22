@@ -93,6 +93,8 @@ main{flex:1;padding:22px 18px 100px}
 .btn-danger{background:var(--coral);color:#fff}
 .btn-ghost{background:var(--mango-tint);color:var(--mango-text);border:1px solid #F5D9AE}
 .btn-line{background:var(--surface);border:1px solid var(--line);color:var(--ink)}
+.btn-verde{background:var(--verde);color:#fff;box-shadow:0 8px 18px -10px rgba(30,156,97,.55)}
+.btn-rojo{background:#B3372A;color:#fff;box-shadow:0 8px 18px -10px rgba(179,55,42,.5)}
 .btn-sm{padding:10px 15px;width:auto;font-size:13px;border-radius:10px}
 .btn[disabled]{opacity:.4;cursor:not-allowed}
 .btnrow{display:flex;gap:10px;margin-top:6px}
@@ -394,10 +396,10 @@ function topbar(){
 function navbar(){
   const item=(v,ic,lb)=>`<button class="${S.view===v?'on':''}" onclick="App.go('${v}')">${svg(ic)}<span>${lb}</span></button>`;
   return `<div class="nav">
-    ${item('inicio','box','Día')}
+    ${item('inicio','box','Inicio')}
     ${item('registrar','cart','Registrar')}
     ${item('cierre','lock','Cierre')}
-    ${item('cobros','money','Cobros')}
+    ${item('cobros','money','Deudas')}
     ${item('ajustes','gear','Ajustes')}
   </div>`;
 }
@@ -424,44 +426,41 @@ function alertaInsumos(){
 }
 function vInicio(){
   const j=DB.jornada;
-  if(!j){
-    return `<div class="view-title">Buen día</div>
-      <div class="view-sub">No hay un día abierto todavía.</div>
-      ${alertaInsumos()}
-      <div class="card"><h3>Empieza la jornada</h3>
-        <p style="color:var(--tinta-soft);font-size:13px;margin-bottom:16px">Registra la entrega de la mañana para arrancar a vender.</p>
-        <button class="btn btn-primary" onclick="App.go('abrir')">${svg('plus')} Abrir el día</button>
-      </div>
-      ${DB.historial.length? `<div class="seclabel">Últimos cierres</div>${listaHistorial(3)}`:''}`;
-  }
-  const {tot}=calcular(j,null);
-  const entregadoU = Object.values(j.entregas).reduce((s,q)=>s+q,0);
-  const entregadoVal = Object.entries(j.entregas).reduce((s,[id,q])=>s+q*prod(id).menudeo,0);
-  const fiadoHoy = j.mayoreo.filter(m=>m.estado==='fiado').reduce((s,m)=>s+m.qty*m.precio,0) + (j.libres||[]).filter(v=>v.estado==='fiado').reduce((s,v)=>s+v.monto,0);
-  return `<div class="view-title">Día abierto</div>
-    <div class="view-sub">${fmtFecha(j.fecha)} · atiende ${nombreUsuario(j.trabajadorId)}</div>
+  let ingresos=0, egresos=0, tot=null;
+  if(j){ tot=calcular(j,null).tot; ingresos=tot.ingMayoreoPag+(tot.ingLibresPag||0)+tot.ingCombo; egresos=tot.gastos; }
+  const balance=ingresos-egresos;
+  const hayEntrega=!!(j&&Object.values(j.entregas||{}).some(q=>q>0));
+  const fiadoHoy=j?(j.mayoreo.filter(m=>m.estado==='fiado').reduce((s,m)=>s+m.qty*m.precio,0)+(j.libres||[]).filter(v=>v.estado==='fiado').reduce((s,v)=>s+v.monto,0)):0;
+  return `<div class="view-title">${j?'Hoy':'Buen día'}</div>
+    <div class="view-sub">${fmtFecha(today())}${j?` · atiende ${nombreUsuario(j.trabajadorId)}`:''}</div>
     ${alertaInsumos()}
-    <div class="card hero">
-      <h3>${entregadoU>0?'Entregado esta mañana':'Ventas de hoy'}</h3>
-      <div class="big">${entregadoU>0?`${entregadoU} <span style="font-size:18px;font-weight:600">und</span>`:$(tot.ventasTotales)}</div>
-      <div class="biglab">${entregadoU>0?`${$(entregadoVal)} a precio de menudeo`:'Modo venta libre — registra y listo'}</div>
+    <div class="card"><h3>Balance de hoy</h3>
+      <div class="row" style="border:none;padding:0 0 12px"><div class="lab" style="font-family:'Fraunces',Georgia,serif;font-size:26px;font-weight:600">${$(balance)}</div><div class="val" style="color:${balance>=0?'var(--verde)':'var(--coral)'}">${balance>=0?'a favor':'en rojo'}</div></div>
+      <div class="row"><div><span class="sub">↗ Ingresos cobrados hoy</span></div><div class="val" style="color:var(--verde)">${$(ingresos)}</div></div>
+      <div class="row"><div><span class="sub">↘ Egresos (gastos)</span></div><div class="val" style="color:var(--coral)">${$(egresos)}</div></div>
+      ${fiadoHoy?`<div class="row"><div><span class="sub">Quedó fiado hoy</span></div><div class="val" style="color:var(--mango-text)">${$(fiadoHoy)}</div></div>`:''}
+      ${hayEntrega?`<div class="hint">El menudeo de la entrega entra al hacer el cierre.</div>`:''}
+    </div>
+    <div class="btnrow">
+      <button class="btn btn-verde" onclick="App.go('registrar')">${svg('plus')} Nueva venta</button>
+      <button class="btn btn-rojo" onclick="App.nuevoGasto()">− Nuevo gasto</button>
+    </div>
+    <div style="height:14px"></div>
+    ${hayEntrega?`<div class="card hero">
+      <h3>Entregado esta mañana</h3>
+      <div class="big">${Object.values(j.entregas).reduce((s,q)=>s+q,0)} <span style="font-size:18px;font-weight:600">und</span></div>
+      <div class="biglab">${$(Object.entries(j.entregas).reduce((s,[id,q])=>s+q*prod(id).menudeo,0))} a precio de menudeo</div>
       <div class="grid2">
-        <div class="mini"><b>${$(tot.ingMayoreoPag+(tot.ingLibresPag||0))}</b><span>Cobrado hoy</span></div>
-        <div class="mini"><b>${$(fiadoHoy)}</b><span>Fiado del día</span></div>
+        <div class="mini"><b>${tot.mayoreoU} und</b><span>Mayoreo</span></div>
+        <div class="mini"><b>${tot.mermaU} und</b><span>Merma</span></div>
       </div>
     </div>
-    <div class="statgrid">
-      <div class="stat"><b>${tot.mayoreoU}</b><span>Mayoreo (und)</span></div>
-      <div class="stat"><b>${tot.comboPagU+tot.comboRegU}</b><span>Combos (und)</span></div>
-      <div class="stat"><b>${tot.mermaU}</b><span>Merma (und)</span></div>
-      <div class="stat"><b>${$(tot.gastos)}</b><span>Gastos</span></div>
-    </div>
-    <div class="card"><h3>Cómo va el día</h3>
-      <p style="color:var(--tinta-soft);font-size:13px">El menudeo y el cuadre de caja se calculan al hacer el <b style="color:var(--tinta)">cierre</b> esta tarde, cuando cuentes lo que quedó.</p>
-    </div>
-    <button class="btn btn-ghost" onclick="App.go('registrar')">${svg('cart')} Registrar una venta</button>
-    <div style="height:10px"></div>
-    <button class="btn btn-dark" onclick="App.go('cierre')">${svg('lock')} Ir al cierre del día</button>`;
+    <button class="btn btn-dark" onclick="App.go('cierre')">${svg('lock')} Ir al cierre del día</button>`
+    :`<div class="card"><h3>¿Repartes mercancía en la mañana?</h3>
+      <p style="color:var(--ink-soft);font-size:13px;margin-bottom:12px">Si entregas productos para liquidarlos en la tarde, abre el día con la entrega. Si no, vende libre y ya.</p>
+      <button class="btn btn-ghost" onclick="App.go('abrir')">Abrir el día con entrega</button></div>
+    ${j?`<button class="btn btn-dark" onclick="App.go('cierre')">${svg('lock')} Cerrar el día</button>`:''}`}
+    ${DB.historial.length?`<div class="seclabel">Últimos cierres</div>${listaHistorial(3)}`:''}`;
 }
 const nombreUsuario = id => (DB.usuarios.find(u=>u.id===id)||{}).nombre||'—';
 const disponible = pid => {
@@ -848,7 +847,7 @@ function vCobros(){
         <button class="btn btn-sm btn-ghost" onclick="App.abonar('${f.id}')">Abonar</button></div></div>`).join('')}
     </div>`;
   }).join('');
-  return `<div class="view-title">Cuentas por cobrar</div>
+  return `<div class="view-title">Deudas por cobrar</div>
     <div class="view-sub">${abiertos.length? `${$(total)} por cobrar en total`:'Nadie debe. Todo al día.'}</div>
     ${abiertos.length? `<div class="statgrid">
         <div class="stat neg"><b>${$(total)}</b><span>Total en la calle</span></div>
@@ -1273,6 +1272,10 @@ const App = {
     App.form('libre'); toast('Cotización lista — ciérrala como venta');
   },
   async delCoti(id){ if(!confirm('¿Quitar esta cotización?')) return; DB.cotizaciones=DB.cotizaciones.filter(x=>x.id!==id); await persist(); render(); },
+  async nuevoGasto(){
+    if(!DB.jornada){ DB.jornada={id:uid(),fecha:today(),trabajadorId:S.user.id,estado:'abierta',entregas:{},mayoreo:[],combos:[],mermas:[],gastos:[],libres:[],cierre:null}; await persist(); }
+    App.form('gasto');
+  },
   async abrirSinEntrega(){
     DB.jornada={id:uid(),fecha:today(),trabajadorId:S.user.id,estado:'abierta',entregas:{},mayoreo:[],combos:[],mermas:[],gastos:[],libres:[],cierre:null};
     await persist(); App.go('registrar'); toast('D\u00eda abierto en modo venta libre');
