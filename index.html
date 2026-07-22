@@ -283,6 +283,7 @@ function seed(){
     insumos:[],          // materias primas: {id,nombre,unidad,stock,umbral,costo}
     proveedores:[],       // {id,nombre,contacto}
     compras:[],           // {id,proveedorId,insumoId,cantidad,costoUnitario,fecha,ts}
+    cotizaciones:[],      // {id,clienteId,concepto,valor,fecha,ts}
     licencia:{activo:true,vence:null,url:'',lastCheck:0,maxDate:''},
     creatorPin:'2468',
   };
@@ -299,7 +300,7 @@ function calcular(j, quedante){
   j.combos.forEach(c=>ids.add(combo(c.comboId).prodId));
 
   let tot = {menudeoU:0, mayoreoU:0, comboPagU:0, comboRegU:0, mermaU:0,
-             ingMenudeo:0, ingMayoreoPag:0, ingMayoreoFiado:0, ingCombo:0,
+             ingMenudeo:0, ingMayoreoPag:0, ingMayoreoFiado:0, ingCombo:0, ingLibresPag:0, ingLibresFiado:0,
              gastos:0, costoVendido:0, costoRegalo:0, costoMerma:0, inconsistencia:false};
 
   ids.forEach(pid=>{
@@ -337,9 +338,10 @@ function calcular(j, quedante){
   tot.gastos = j.gastos.reduce((s,g)=>s+g.monto,0);
 
   // Caja esperada (lo que debería haber en efectivo)
-  tot.efectivoEsperado = tot.ingMenudeo + tot.ingMayoreoPag + tot.ingCombo - tot.gastos;
+  (j.libres||[]).forEach(v=>{ if(v.estado==='fiado') tot.ingLibresFiado+=v.monto; else tot.ingLibresPag+=v.monto; });
+  tot.efectivoEsperado = tot.ingMenudeo + tot.ingMayoreoPag + tot.ingCombo + tot.ingLibresPag - tot.gastos;
   // Ganancia neta del día (ventas totales - costo - regalos - merma - gastos)
-  tot.ventasTotales = tot.ingMenudeo + tot.ingMayoreoPag + tot.ingMayoreoFiado + tot.ingCombo;
+  tot.ventasTotales = tot.ingMenudeo + tot.ingMayoreoPag + tot.ingMayoreoFiado + tot.ingCombo + tot.ingLibresPag + tot.ingLibresFiado;
   tot.gananciaNeta  = tot.ventasTotales - tot.costoVendido - tot.costoRegalo - tot.costoMerma - tot.gastos;
   return {porProd, tot};
 }
@@ -435,16 +437,16 @@ function vInicio(){
   const {tot}=calcular(j,null);
   const entregadoU = Object.values(j.entregas).reduce((s,q)=>s+q,0);
   const entregadoVal = Object.entries(j.entregas).reduce((s,[id,q])=>s+q*prod(id).menudeo,0);
-  const fiadoHoy = j.mayoreo.filter(m=>m.estado==='fiado').reduce((s,m)=>s+m.qty*m.precio,0);
+  const fiadoHoy = j.mayoreo.filter(m=>m.estado==='fiado').reduce((s,m)=>s+m.qty*m.precio,0) + (j.libres||[]).filter(v=>v.estado==='fiado').reduce((s,v)=>s+v.monto,0);
   return `<div class="view-title">Día abierto</div>
     <div class="view-sub">${fmtFecha(j.fecha)} · atiende ${nombreUsuario(j.trabajadorId)}</div>
     ${alertaInsumos()}
     <div class="card hero">
-      <h3>Entregado esta mañana</h3>
-      <div class="big">${entregadoU} <span style="font-size:18px;font-weight:600">und</span></div>
-      <div class="biglab">${$(entregadoVal)} a precio de menudeo</div>
+      <h3>${entregadoU>0?'Entregado esta mañana':'Ventas de hoy'}</h3>
+      <div class="big">${entregadoU>0?`${entregadoU} <span style="font-size:18px;font-weight:600">und</span>`:$(tot.ventasTotales)}</div>
+      <div class="biglab">${entregadoU>0?`${$(entregadoVal)} a precio de menudeo`:'Modo venta libre — registra y listo'}</div>
       <div class="grid2">
-        <div class="mini"><b>${$(tot.ingMayoreoPag)}</b><span>Mayoreo cobrado</span></div>
+        <div class="mini"><b>${$(tot.ingMayoreoPag+(tot.ingLibresPag||0))}</b><span>Cobrado hoy</span></div>
         <div class="mini"><b>${$(fiadoHoy)}</b><span>Fiado del día</span></div>
       </div>
     </div>
@@ -481,35 +483,43 @@ function vAbrir(){
     <div class="card qtygrid"><h3>Cantidades entregadas</h3>${rows}</div>
     <button class="btn btn-primary" onclick="App.abrirDia()">Abrir el día con esta entrega</button>
     <div style="height:8px"></div>
+    <button class="btn btn-ghost" onclick="App.abrirSinEntrega()">Abrir sin entrega (solo ventas libres)</button>
+    <div style="height:8px"></div>
     <button class="btn btn-line" onclick="App.go('inicio')">Cancelar</button>`;
 }
 
 /* ------------------------------- REGISTRAR ------------------------------- */
 function vRegistrar(){
-  if(!DB.jornada) return noDia();
+  const j=DB.jornada;
   return `<div class="view-title">Registrar</div>
-    <div class="view-sub">Solo lo que no es menudeo suelto: mayoreo, combos, merma y gastos.</div>
+    <div class="view-sub">${j?'Venta libre para lo rápido; lo demás cuando aplique.':'Registra ventas libres — el día se abre solo.'}</div>
     <div class="tiles">
-      <button class="tile" onclick="App.form('mayoreo')"><div class="ico">${svg('users')}</div><b>Venta al por mayor</b><span>Con cliente y precio mayoreo</span></button>
-      <button class="tile hoja" onclick="App.form('combo')"><div class="ico">${svg('tag')}</div><b>Combo</b><span>Lleva más, paga menos</span></button>
+      <button class="tile hoja" onclick="App.form('libre')"><div class="ico">${svg('money')}</div><b>Venta libre</b><span>Cliente y valor, sin escoger productos</span></button>
+      <button class="tile" onclick="App.form('coti')"><div class="ico">${svg('tag')}</div><b>Cotización</b><span>Pásale el precio al cliente</span></button>
+      ${j?`<button class="tile" onclick="App.form('mayoreo')"><div class="ico">${svg('users')}</div><b>Venta al por mayor</b><span>Con productos y precio mayoreo</span></button>
+      <button class="tile" onclick="App.form('combo')"><div class="ico">${svg('tag')}</div><b>Combo</b><span>Lleva más, paga menos</span></button>
       <button class="tile aji" onclick="App.form('merma')"><div class="ico">${svg('warn')}</div><b>Merma</b><span>Dañado o vencido</span></button>
-      <button class="tile" onclick="App.form('gasto')"><div class="ico">${svg('money')}</div><b>Gasto</b><span>Hielo, aceite, gas…</span></button>
+      <button class="tile" onclick="App.form('gasto')"><div class="ico">${svg('money')}</div><b>Gasto</b><span>Hielo, aceite, gas…</span></button>`:''}
     </div>
-    ${resumenRegistros()}`;
+    ${j?resumenRegistros():`<div class="card" style="margin-top:14px"><h3>¿Entregas productos en la mañana?</h3><p style="color:var(--ink-soft);font-size:13px;margin-bottom:12px">Si hoy repartes mercancía para liquidarla en la tarde, abre el día con la entrega.</p><button class="btn btn-ghost" onclick="App.go('abrir')">Abrir el día con entrega</button></div>`}`;
 }
 function resumenRegistros(){
   const j=DB.jornada; const items=[];
+  (j.libres||[]).forEach(v=>{let pg;if(v.estado==='fiado'){pg='<span class="pill f">Fiado</span>';}else{const pt=[];if(v.efectivo)pt.push($(v.efectivo)+' efectivo');if(v.transferencia)pt.push($(v.transferencia)+' transf.');pg='<span class="pill v">'+(pt.join(' + ')||'Pagado')+'</span>';}
+    let verif='';
+    if(v.transferencia>0){ verif=esAdmin()?`<div><button class="btn btn-sm ${v.verificada?'btn-ghost':'btn-line'}" style="margin-top:6px" onclick="App.toggleVerif('${v.id}')">${v.verificada?'✓ Transferencia verificada':'Verificar transferencia'}</button></div>`:(v.verificada?'<div><span class="pill v" style="margin-top:6px">✓ Verificada</span></div>':''); }
+    items.push({t:'Venta libre'+(v.referencia?' · Ref. '+v.referencia:''),d:(v.clienteId?cliente(v.clienteId).nombre:'Venta rápida')+(v.concepto?' · '+v.concepto:''),v:$(v.monto),p:pg,extra:verif,x:`App.delRegistro('libre','${v.id}')`,r:`App.compartirRecibo('libre','${v.id}')`});});
   j.mayoreo.forEach(m=>{let pg;if(m.estado==='fiado'){pg='<span class="pill f">Fiado</span>';}else{const pt=[];if(m.efectivo)pt.push($(m.efectivo)+' efectivo');if(m.transferencia)pt.push($(m.transferencia)+' transf.');pg='<span class="pill v">'+(pt.join(' + ')||'Pagado')+'</span>';}
     let verif='';
     if(m.transferencia>0){ verif=esAdmin()?`<div><button class="btn btn-sm ${m.verificada?'btn-ghost':'btn-line'}" style="margin-top:6px" onclick="App.toggleVerif('${m.id}')">${m.verificada?'✓ Transferencia verificada':'Verificar transferencia'}</button></div>`:(m.verificada?'<div><span class="pill v" style="margin-top:6px">✓ Verificada</span></div>':''); }
-    items.push({t:'Venta al por mayor'+(m.referencia?' · Ref. '+m.referencia:''),d:`${m.qty} × ${prod(m.prodId).nombre} · ${cliente(m.clienteId).nombre}`,v:$(m.qty*m.precio),p:pg,extra:verif,x:`App.delRegistro('mayoreo','${m.id}')`});});
+    items.push({t:'Venta al por mayor'+(m.referencia?' · Ref. '+m.referencia:''),d:`${m.qty} × ${prod(m.prodId).nombre} · ${cliente(m.clienteId).nombre}`,v:$(m.qty*m.precio),p:pg,extra:verif,x:`App.delRegistro('mayoreo','${m.id}')`,r:`App.compartirRecibo('mayoreo','${m.id}')`});});
   j.combos.forEach(c=>{const cb=combo(c.comboId);items.push({t:'Combo',d:`${c.qty} × ${cb.nombre}`,v:`+${cb.bono*c.qty} regaladas`,p:'<span class="pill g">Combo</span>',x:`App.delRegistro('combo','${c.id}')`});});
   j.mermas.forEach(m=>items.push({t:'Producto dañado (merma)',d:`${m.qty} × ${prod(m.prodId).nombre}`,v:'',p:m.confirmada?'<span class="pill v">Confirmada</span>':'<span class="pill p">Sin confirmar</span>',x:`App.delRegistro('merma','${m.id}')`}));
   j.gastos.forEach(g=>items.push({t:'Gasto',d:g.concepto,v:'−'+$(g.monto),p:'',x:`App.delRegistro('gasto','${g.id}')`}));
   if(!items.length) return '';
   return `<div class="seclabel">Registrado hoy</div><div class="card">${items.map(it=>`
     <div class="row"><div style="flex:1"><div class="lab">${it.d}</div><div class="sub">${it.t}</div>${it.extra||''}</div>
-    <div style="text-align:right"><div class="val">${it.v}</div>${it.p}<div><button class="xdel" onclick="${it.x}">Quitar</button></div></div></div>`).join('')}</div>
+    <div style="text-align:right"><div class="val">${it.v}</div>${it.p}<div>${it.r?`<button class="xdel" style="color:var(--mango-text);margin-right:12px" onclick="${it.r}">Recibo</button>`:''}<button class="xdel" onclick="${it.x}">Quitar</button></div></div></div>`).join('')}</div>
     <div class="hint" style="margin-top:-6px">¿Te equivocaste en algo? Puedes quitarlo mientras el día siga abierto.</div>`;
 }
 
@@ -519,6 +529,41 @@ function vForm(){
   const back=`<div style="height:8px"></div><button class="btn btn-line" onclick="App.go('registrar')">Cancelar</button>`;
   const backAj=`<div style="height:8px"></div><button class="btn btn-line" onclick="App.volverAjustes()">Cancelar</button>`;
   const opciones = (arr,val='id',lab='nombre') => arr.map(o=>`<option value="${o[val]}">${o[lab]}</option>`).join('');
+  if(t==='coti'){
+    const lista=[...(DB.cotizaciones||[])].sort((a,b)=>b.ts-a.ts).slice(0,10);
+    return `<div class="view-title">Cotización</div><div class="view-sub">Mándale el precio al cliente; si acepta, la conviertes en venta con un toque.</div>
+      <div class="card">
+        <label class="fld"><span>Cliente <span style="font-weight:500;text-transform:none">(opcional)</span></span><select id="c2_cli"><option value="">Sin cliente</option>${DB.clientes.map(c=>`<option value="${c.id}">${c.nombre}</option>`).join('')}</select></label>
+        <label class="fld"><span>¿Qué cotiza?</span><input type="text" id="c2_conc" placeholder="Ej. 200 empanadas y 100 papas"></label>
+        <label class="fld"><span>Valor</span><input type="number" min="0" inputmode="numeric" id="c2_val" placeholder="0"></label>
+      </div>
+      <button class="btn btn-primary" onclick="App.saveCoti()">Guardar y compartir</button>${back}
+      ${lista.length?`<div class="seclabel">Cotizaciones recientes</div><div class="card">${lista.map(q=>`
+        <div class="row"><div style="flex:1"><div class="lab">${q.clienteId?cliente(q.clienteId).nombre:'Sin cliente'}</div><div class="sub">${q.concepto} · ${fmtFecha(q.fecha)}</div>
+          <div><button class="xdel" style="color:var(--mango-text);margin-right:12px" onclick="App.compartirCoti('${q.id}')">Compartir</button><button class="xdel" style="color:var(--verde);margin-right:12px" onclick="App.cotiAVenta('${q.id}')">Convertir en venta</button><button class="xdel" onclick="App.delCoti('${q.id}')">Quitar</button></div></div>
+        <div class="val">${$(q.valor)}</div></div>`).join('')}</div>`:''}`;
+  }
+  if(t==='libre'){
+    const tmp=S.ctx.libreTmp||{};
+    return `<div class="view-title">Venta libre</div><div class="view-sub">Registra la venta por su valor total, sin escoger productos.</div>
+      <div class="card">
+        <label class="fld"><span>Valor de la venta</span><input type="number" min="0" inputmode="numeric" id="l_monto" value="${tmp.monto||''}" placeholder="0" oninput="App.libreMonto()"></label>
+        <label class="fld" style="margin-bottom:6px"><span>Descuento <span style="font-weight:500;text-transform:none">(opcional, en pesos)</span></span><input type="number" min="0" inputmode="numeric" id="l_desc" placeholder="0" oninput="App.libreMonto()"></label>
+        <div class="hint" id="l_tot" style="margin-bottom:14px"></div>
+        <label class="fld"><span>Cliente <span style="font-weight:500;text-transform:none">(obligatorio si queda debiendo)</span></span>
+          <div style="display:flex;gap:8px"><select id="l_cli" style="flex:1"><option value="">Sin cliente</option>${DB.clientes.map(c=>`<option value="${c.id}" ${tmp.clienteId===c.id?'selected':''}>${c.nombre}</option>`).join('')}</select>
+          <button class="btn btn-sm btn-ghost" style="width:auto" onclick="App.libreNuevoCliente()">+ Nuevo</button></div></label>
+        <label class="fld"><span>¿Qué se llevó? <span style="font-weight:500;text-transform:none">(opcional)</span></span><input type="text" id="l_conc" value="${tmp.concepto||''}" placeholder="Ej. 100 empanadas y 50 papas"></label>
+        <label class="fld"><span>Pago</span><select id="f_estado" onchange="App.mayoreoEstado()"><option value="pagado">Pagado ahora</option><option value="fiado" ${tmp.estado==='fiado'?'selected':''}>Fiado (queda debiendo)</option></select></label>
+        <div id="f_pagobox">
+        <label class="fld"><span>Efectivo</span><input type="number" min="0" inputmode="numeric" id="f_efec" placeholder="0" oninput="App.mayoreoSplit('ef')"></label>
+        <label class="fld" style="margin-bottom:6px"><span>Transferencia / Nequi</span><input type="number" min="0" inputmode="numeric" id="f_transf" placeholder="0" oninput="App.mayoreoSplit('tr')"></label>
+        <div class="hint">Escribe uno y el otro se completa solo (suma el valor total).</div>
+        <label class="fld" style="margin-top:10px"><span>Referencia <span style="font-weight:500;text-transform:none">(si hubo transferencia)</span></span><input type="text" id="f_ref" placeholder="N.º de referencia"></label>
+        </div>
+      </div>
+      <button class="btn btn-primary" onclick="App.saveLibre()">Guardar venta</button>${back}`;
+  }
   if(t==='mayoreo'){
     return `<div class="view-title">Venta al por mayor</div><div class="view-sub">Toda venta mayoreo va a nombre de un cliente.</div>
       <div class="card">
@@ -693,7 +738,7 @@ function vCierre(){
   }).join('');
   return `<div class="view-title">Cierre del día</div>
     <div class="view-sub">Cuenta lo que quedó sin vender y entrega la caja.</div>
-    <div class="card qtygrid"><h3>¿Cuánto quedó de cada uno?</h3>${rows}</div>
+    ${rows?`<div class="card qtygrid"><h3>¿Cuánto quedó de cada uno?</h3>${rows}</div>`:`<div class="card"><h3>Día de ventas libres</h3><p style="color:var(--ink-soft);font-size:13px">Hoy no hubo entrega de productos — solo cuadra la plata.</p></div>`}
     <div class="card"><h3>Cómo entró la plata</h3>
       <div class="row" style="border:none;padding:0 0 10px"><div class="lab">Total de la venta</div><div class="val" id="c_total">${$(0)}</div></div>
       <label class="fld"><span>Efectivo</span><input type="number" min="0" inputmode="numeric" id="q_efectivo" placeholder="0" oninput="App.splitPago('ef')"></label>
@@ -734,9 +779,12 @@ function vInforme(){
       <div class="row"><div class="lab">Efectivo</div><div class="val">${$(j.cierre.efectivo)}</div></div>
       <div class="row"><div class="lab">Transferencia / Nequi</div><div class="val">${$(j.cierre.transfer)}</div></div>
     </div>`:''}
-    ${j.mayoreo.some(m=>m.transferencia>0)?`<div class="card"><h3>Transferencias del día</h3>${j.mayoreo.filter(m=>m.transferencia>0).map(m=>`
-      <div class="row"><div><div class="lab">${cliente(m.clienteId).nombre}</div><div class="sub">${m.referencia?('Ref. '+m.referencia):'Sin referencia'}</div></div>
+    ${[...j.mayoreo,...(j.libres||[])].some(m=>m.transferencia>0)?`<div class="card"><h3>Transferencias del día</h3>${[...j.mayoreo,...(j.libres||[])].filter(m=>m.transferencia>0).map(m=>`
+      <div class="row"><div><div class="lab">${m.clienteId?cliente(m.clienteId).nombre:'Venta libre'}</div><div class="sub">${m.referencia?('Ref. '+m.referencia):'Sin referencia'}</div></div>
       <div style="text-align:right"><div class="val">${$(m.transferencia)}</div>${m.verificada?'<span class="pill v">Verificada</span>':'<span class="pill p">Por verificar</span>'}</div></div>`).join('')}</div>`:''}
+    ${(j.libres&&j.libres.length)?`<div class="card"><h3>Ventas libres del día</h3>${j.libres.map(v=>`
+      <div class="row"><div><div class="lab">${v.clienteId?cliente(v.clienteId).nombre:'Venta rápida'}</div><div class="sub">${v.concepto||'Sin detalle'}</div></div>
+      <div style="text-align:right"><div class="val">${$(v.monto)}</div>${v.estado==='fiado'?'<span class="pill f">Fiado</span>':'<span class="pill v">Pagada</span>'}</div></div>`).join('')}</div>`:''}
     ${tot.inconsistencia?`<div class="warnbox">${svg('warn')} Ojo: en algún producto se registró más de lo que salió. Revisa las cantidades.</div>`:''}
     ${barraGanancias(tot)}
     <div class="statgrid">
@@ -757,7 +805,7 @@ function vInforme(){
     ${share}${back}`;
 }
 function barraGanancias(tot){
-  const ganado=Math.max(0,tot.gananciaNeta), enCalle=Math.max(0,tot.ingMayoreoFiado), perdido=Math.max(0,tot.costoMerma+tot.costoRegalo);
+  const ganado=Math.max(0,tot.gananciaNeta), enCalle=Math.max(0,tot.ingMayoreoFiado+(tot.ingLibresFiado||0)), perdido=Math.max(0,tot.costoMerma+tot.costoRegalo);
   const total=ganado+enCalle+perdido; if(total<=0) return '';
   const pg=Math.round(ganado/total*1000)/10, pc=Math.round(enCalle/total*1000)/10, pp=Math.max(0,100-pg-pc);
   return `<div class="card"><h3>De un vistazo</h3>
@@ -981,6 +1029,7 @@ function tryLogin(){
 function bindView(){
   hookCreatorTaps();
   if(S.view==='form' && S.sub==='mayoreo'){ _mayLast='tr'; App.mayoreoPrecio(); App.mayoreoEstado(); }
+  if(S.view==='form' && S.sub==='libre'){ _mayLast='tr'; App.libreMonto(); App.mayoreoEstado(); }
   if(S.view==='form' && S.sub==='combo') App.comboInfo();
   if(S.view==='form' && S.sub==='merma') App.mermaInfo();
   if(S.view==='cierre'){ _lastPago='tr'; cierreRecalc(); }
@@ -1002,7 +1051,7 @@ const App = {
     Object.entries(entregas).forEach(([pid,qty])=>{
       const p=prod(pid); if(p.receta&&p.receta.length){ p.receta.forEach(r=>{ const ins=insumo(r.insumoId); if(ins.id) ins.stock=Math.round((ins.stock-r.cantidad*qty)*1000)/1000; }); }
     });
-    DB.jornada={id:uid(),fecha:today(),trabajadorId:S.user.id,estado:'abierta',entregas,mayoreo:[],combos:[],mermas:[],gastos:[],cierre:null};
+    DB.jornada={id:uid(),fecha:today(),trabajadorId:S.user.id,estado:'abierta',entregas,mayoreo:[],combos:[],mermas:[],gastos:[],libres:[],cierre:null};
     await persist(); App.go('inicio'); toast('Día abierto');
   },
 
@@ -1083,6 +1132,10 @@ const App = {
       DB.fiados.push({id:uid(),clienteId:m.clienteId,jornadaId:j.id,fecha:j.fecha,
         detalle:`${m.qty} × ${prod(m.prodId).nombre}`,monto:m.qty*m.precio,estado:'abierto',abonos:[]});
     });
+    (j.libres||[]).filter(v=>v.estado==='fiado').forEach(v=>{
+      DB.fiados.push({id:uid(),clienteId:v.clienteId,jornadaId:j.id,fecha:j.fecha,
+        detalle:v.concepto||'Venta libre',monto:v.monto,estado:'abierto',abonos:[]});
+    });
     DB.historial.push(j); DB.jornada=null;
     await persist();
     S.ctx={jornada:j,from:'cierre'}; S.view='informe'; render(); window.scrollTo(0,0);
@@ -1154,6 +1207,76 @@ const App = {
   mermaInfo(){ const sel=document.getElementById('f_prod'); if(!sel) return; const d=document.getElementById('f_disp'); if(!d) return; const disp=disponible(sel.value); d.textContent=`Disponible hoy: ${disp} und`; d.style.color='var(--ink-soft)'; },
   mayoreoSplit(w){ _mayLast=w; mayoreoRebalance(); },
   mayoreoEstado(){ const box=document.getElementById('f_pagobox'); if(box) box.style.display=document.getElementById('f_estado').value==='fiado'?'none':''; },
+  libreMonto(){
+    const m=document.getElementById('l_monto'); if(!m) return;
+    const valor=parseInt(m.value)||0;
+    const desc=Math.min(parseInt((document.getElementById('l_desc')||{}).value)||0, valor);
+    _mayTotal=valor-desc; mayoreoRebalance();
+    const t=document.getElementById('l_tot'); if(t) t.textContent=desc>0?('Total a cobrar: '+$(_mayTotal)):'';
+  },
+  async libreNuevoCliente(){
+    S.ctx.libreTmp={monto:(document.getElementById('l_monto')||{}).value||'',concepto:(document.getElementById('l_conc')||{}).value||'',estado:(document.getElementById('f_estado')||{}).value||'pagado',clienteId:''};
+    const nombre=prompt('Nombre del cliente:'); if(!nombre){ return; }
+    const contacto=prompt('Contacto (opcional):')||'';
+    const nc={id:uid(),nombre:nombre.trim(),contacto}; DB.clientes.push(nc);
+    S.ctx.libreTmp.clienteId=nc.id;
+    await persist(); render(); toast('Cliente agregado');
+  },
+  async saveLibre(){
+    const _valor=parseInt(document.getElementById('l_monto').value)||0;
+    const _desc=Math.min(parseInt((document.getElementById('l_desc')||{}).value)||0,_valor);
+    const monto=_valor-_desc;
+    if(monto<1){ toast('Escribe el valor de la venta'); return; }
+    const clienteId=document.getElementById('l_cli').value||'';
+    const estado=document.getElementById('f_estado').value;
+    if(estado==='fiado'&&!clienteId){ toast('El fiado necesita un cliente con nombre'); return; }
+    let ef=0,tr=0;
+    if(estado==='pagado'){ ef=Math.min(parseInt(document.getElementById('f_efec').value)||0,monto); tr=Math.max(0,monto-ef); }
+    const concepto=(document.getElementById('l_conc').value||'').trim();
+    const referencia=(document.getElementById('f_ref').value||'').trim();
+    if(!DB.jornada){ DB.jornada={id:uid(),fecha:today(),trabajadorId:S.user.id,estado:'abierta',entregas:{},mayoreo:[],combos:[],mermas:[],gastos:[],libres:[],cierre:null}; }
+    DB.jornada.libres=DB.jornada.libres||[];
+    DB.jornada.libres.push({id:uid(),clienteId,monto,descuento:_desc,efectivo:ef,transferencia:tr,estado,concepto,referencia,verificada:false,ts:Date.now()});
+    S.ctx={};
+    await persist(); App.go('registrar'); toast('Venta registrada');
+  },
+  compartirRecibo(tipo,id){
+    const j=DB.jornada; if(!j) return;
+    let head='',total=0,x=null;
+    if(tipo==='libre'){ x=(j.libres||[]).find(v=>v.id===id); if(!x) return; total=x.monto; head=(x.clienteId?'Cliente: '+cliente(x.clienteId).nombre+'\n':'')+(x.concepto?'Detalle: '+x.concepto+'\n':''); if(x.descuento){ head+='Valor: '+$(x.monto+x.descuento)+'\nDescuento: -'+$(x.descuento)+'\n'; } }
+    else { x=j.mayoreo.find(v=>v.id===id); if(!x) return; total=x.qty*x.precio; head='Cliente: '+cliente(x.clienteId).nombre+'\nDetalle: '+x.qty+' \u00d7 '+prod(x.prodId).nombre+'\n'; }
+    let pago;
+    if(x.estado==='fiado') pago='Queda debiendo (fiado)';
+    else { const pp=[]; if(x.efectivo) pp.push('Efectivo: '+$(x.efectivo)); if(x.transferencia) pp.push('Transferencia: '+$(x.transferencia)+(x.referencia?' \u00b7 Ref. '+x.referencia:'')); pago=pp.join('\n')||'Pagado'; }
+    const txt='LAS ANTIOQUE\u00d1AS \u2014 Recibo\n'+head+'Total: '+$(total)+'\n'+pago+'\nFecha: '+fmtFecha(j.fecha);
+    if(navigator.share){ navigator.share({text:txt}).catch(()=>{}); }
+    else window.open('https://wa.me/?text='+encodeURIComponent(txt),'_blank');
+  },
+  async saveCoti(){
+    const valor=parseInt(document.getElementById('c2_val').value)||0;
+    const concepto=(document.getElementById('c2_conc').value||'').trim();
+    if(valor<1||!concepto){ toast('Escribe qué cotiza y el valor'); return; }
+    const clienteId=document.getElementById('c2_cli').value||'';
+    const q={id:uid(),clienteId,concepto,valor,fecha:today(),ts:Date.now()};
+    DB.cotizaciones.push(q);
+    await persist(); render(); App.compartirCoti(q.id);
+  },
+  compartirCoti(id){
+    const q=DB.cotizaciones.find(x=>x.id===id); if(!q) return;
+    const txt='LAS ANTIOQUE\u00d1AS \u2014 Cotizaci\u00f3n\n'+(q.clienteId?'Cliente: '+cliente(q.clienteId).nombre+'\n':'')+'Detalle: '+q.concepto+'\nValor: '+$(q.valor)+'\nFecha: '+fmtFecha(q.fecha);
+    if(navigator.share){ navigator.share({text:txt}).catch(()=>{}); }
+    else window.open('https://wa.me/?text='+encodeURIComponent(txt),'_blank');
+  },
+  cotiAVenta(id){
+    const q=DB.cotizaciones.find(x=>x.id===id); if(!q) return;
+    S.ctx.libreTmp={monto:q.valor,clienteId:q.clienteId,concepto:q.concepto,estado:'pagado'};
+    App.form('libre'); toast('Cotización lista — ciérrala como venta');
+  },
+  async delCoti(id){ if(!confirm('¿Quitar esta cotización?')) return; DB.cotizaciones=DB.cotizaciones.filter(x=>x.id!==id); await persist(); render(); },
+  async abrirSinEntrega(){
+    DB.jornada={id:uid(),fecha:today(),trabajadorId:S.user.id,estado:'abierta',entregas:{},mayoreo:[],combos:[],mermas:[],gastos:[],libres:[],cierre:null};
+    await persist(); App.go('registrar'); toast('D\u00eda abierto en modo venta libre');
+  },
   async nuevoClienteRapido(){
     const nombre=prompt('Nombre del nuevo cliente:'); if(!nombre) return;
     const contacto=prompt('Contacto (opcional):')||'';
@@ -1216,6 +1339,7 @@ const App = {
   async delRegistro(tipo,id){
     const j=DB.jornada; if(!j) return;
     if(!confirm('¿Quitar este registro del día?')) return;
+    if(tipo==='libre') j.libres=(j.libres||[]).filter(x=>x.id!==id);
     if(tipo==='mayoreo') j.mayoreo=j.mayoreo.filter(x=>x.id!==id);
     if(tipo==='combo') j.combos=j.combos.filter(x=>x.id!==id);
     if(tipo==='merma') j.mermas=j.mermas.filter(x=>x.id!==id);
@@ -1223,14 +1347,14 @@ const App = {
     await persist(); render(); toast('Registro quitado');
   },
   async toggleVerif(id){
-    const m=DB.jornada&&DB.jornada.mayoreo.find(x=>x.id===id); if(!m) return;
+    const m=DB.jornada&&(DB.jornada.mayoreo.find(x=>x.id===id)||(DB.jornada.libres||[]).find(x=>x.id===id)); if(!m) return;
     m.verificada=!m.verificada; await persist(); render();
     toast(m.verificada?'Transferencia verificada':'Marca de verificación quitada');
   },
   compartirInforme(){
     const j=S.ctx.jornada; if(!j) return;
     const {tot}=calcular(j,j.cierre.quedante);
-    const dif=j.cierre.diferencia; const fiadoDia=tot.ingMayoreoFiado;
+    const dif=j.cierre.diferencia; const fiadoDia=tot.ingMayoreoFiado+(tot.ingLibresFiado||0);
     const txt=`LAS ANTIOQUEÑAS — Informe del ${fmtFecha(j.fecha)}\n`+
       `Ventas totales: ${$(tot.ventasTotales)}\n`+
       `Ganancia del día: ${$(tot.gananciaNeta)}\n`+
@@ -1402,8 +1526,9 @@ function bindCreator(){}
 /* ================================ BOOT ================================ */
 function sanea(){
   DB.fiados=DB.fiados||[]; DB.historial=DB.historial||[]; DB.combos=DB.combos||[];
-  DB.insumos=DB.insumos||[]; DB.proveedores=DB.proveedores||[]; DB.compras=DB.compras||[];
+  DB.insumos=DB.insumos||[]; DB.proveedores=DB.proveedores||[]; DB.compras=DB.compras||[]; DB.cotizaciones=DB.cotizaciones||[];
   DB.compras.forEach(c=>{ if(!c.tipo) c.tipo='insumo'; });
+  if(DB.jornada && !DB.jornada.libres) DB.jornada.libres=[];
   DB.productos.forEach(p=>{ if(!p.receta) p.receta=[]; });
   DB.licencia=DB.licencia||{activo:true,vence:null,url:'',lastCheck:0,maxDate:''};
   DB.creatorPin=DB.creatorPin||'2468';
