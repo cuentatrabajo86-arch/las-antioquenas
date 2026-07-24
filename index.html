@@ -266,7 +266,6 @@ const fmtFecha = d => new Date(d+'T12:00:00').toLocaleDateString('es-CO',{weekda
 const COP = new Intl.NumberFormat('es-CO',{style:'currency',currency:'COP',maximumFractionDigits:0});
 const $ = money => COP.format(Math.round(money||0));
 const prod = id => DB.productos.find(p=>p.id===id)||{};
-const combo = id => DB.combos.find(c=>c.id===id)||{};
 const cliente = id => DB.clientes.find(c=>c.id===id)||{nombre:'—'};
 const insumo = id => DB.insumos.find(i=>i.id===id)||{nombre:'—',unidad:'',stock:0,umbral:0,costo:0};
 const proveedor = id => DB.proveedores.find(v=>v.id===id)||{nombre:'—'};
@@ -285,7 +284,6 @@ function seed(){
       {id:'p4',nombre:'Gaseosa',menudeo:2500,mayoreo:2200,costo:1500,activo:true,receta:[]},
       {id:'p5',nombre:'Jugo natural',menudeo:3000,mayoreo:2600,costo:1400,activo:true,receta:[]},
     ],
-    combos:[ {id:'c1',prodId:'p1',nombre:'Empanadas 10 + 2',gatillo:10,bono:2,activo:true} ],
     clientes:[
       {id:'cl1',nombre:'Tienda La Esquina',contacto:'310 555 1122'},
       {id:'cl2',nombre:'Cafetería Marisol',contacto:'320 555 8899'},
@@ -302,67 +300,47 @@ function seed(){
     compras:[],           // {id,proveedorId,insumoId,cantidad,costoUnitario,fecha,ts}
     cotizaciones:[],      // {id,clienteId,concepto,valor,fecha,ts}
     negocio:{nombre:'LAS ANTIOQUEÑAS',sub:'Fritos y bebidas',tel:'',nit:''},
-    pinMetodo:'2580',   // clave para abrir el método antiguo de entrega+liquidación
     licencia:{activo:true,vence:null,url:'',lastCheck:0,maxDate:''},
     creatorPin:'2468',
   };
 }
 
 /* ============================ CÁLCULO NÚCLEO ============================ */
-/* Reparte cada producto entre los "baldes" y saca el cuadre de caja.
-   quedante = mapa {prodId: cantidad} en el cierre, o null durante el día. */
-function calcular(j, quedante){
+/* Suma lo vendido del día: mayoreo + venta libre, menos costos, gastos,
+   mermas y devoluciones. Sin entregas, sin liquidación, sin combos. */
+function calcular(j){
   const porProd = {};
-  const ids = new Set(Object.keys(j.entregas||{}));
+  const ids = new Set();
   j.mayoreo.forEach(m=>ids.add(m.prodId));
   j.mermas.forEach(m=>ids.add(m.prodId));
-  j.combos.forEach(c=>ids.add(combo(c.comboId).prodId));
-
-  let tot = {menudeoU:0, mayoreoU:0, comboPagU:0, comboRegU:0, mermaU:0,
-             ingMenudeo:0, ingMayoreoPag:0, ingMayoreoFiado:0, ingCombo:0, ingLibresPag:0, ingLibresFiado:0,
-             gastos:0, costoVendido:0, costoRegalo:0, costoMerma:0, inconsistencia:false};
-
+  let tot = {mayoreoU:0, mermaU:0,
+             ingMayoreoPag:0, ingMayoreoFiado:0, ingLibresPag:0, ingLibresFiado:0,
+             gastos:0, devoluciones:0, costoVendido:0, costoMerma:0, inconsistencia:false};
   ids.forEach(pid=>{
     const P=prod(pid);
-    const entregado = (j.entregas&&j.entregas[pid])||0;
     const mayU = j.mayoreo.filter(m=>m.prodId===pid).reduce((s,m)=>s+m.qty,0);
-    let cPag=0,cReg=0;
-    j.combos.forEach(cv=>{ const cb=combo(cv.comboId); if(cb.prodId===pid){ cPag+=cb.gatillo*cv.qty; cReg+=cb.bono*cv.qty; }});
     const mermaU = j.mermas.filter(m=>m.prodId===pid).reduce((s,m)=>s+m.qty,0);
-    const comboU = cPag+cReg;
-    let menU=null;
-    if(quedante){
-      const q = quedante[pid]||0;
-      menU = entregado - q - mayU - comboU - mermaU;
-      if(menU<0){ tot.inconsistencia=true; }
-    }
-    porProd[pid]={entregado, mayU, cPag, cReg, mermaU, menU};
-
-    tot.mayoreoU+=mayU; tot.comboPagU+=cPag; tot.comboRegU+=cReg; tot.mermaU+=mermaU;
-    if(menU!=null){
-      const m=Math.max(0,menU);
-      tot.menudeoU+=m;
-      tot.ingMenudeo+= m*P.menudeo;
-      tot.costoVendido += (m+mayU+cPag)*P.costo;
-    }
-    tot.ingCombo += cPag*P.menudeo;
-    tot.costoRegalo += cReg*P.costo;
+    porProd[pid]={mayU, mermaU};
+    tot.mayoreoU+=mayU; tot.mermaU+=mermaU;
+    tot.costoVendido += mayU*P.costo;
     tot.costoMerma  += mermaU*P.costo;
   });
-
   j.mayoreo.forEach(m=>{
-    const val=m.qty*m.precio;
-    if(m.estado==='fiado') tot.ingMayoreoFiado+=val; else tot.ingMayoreoPag+=val;
+    const total=m.qty*m.precio;
+    const abono=(m.efectivo||0)+(m.transferencia||0);
+    const saldo=(m.saldo!=null)?m.saldo:Math.max(0,total-abono);
+    tot.ingMayoreoPag+=(total-saldo); tot.ingMayoreoFiado+=saldo;
+  });
+  (j.libres||[]).forEach(v=>{
+    const abono=(v.efectivo||0)+(v.transferencia||0);
+    const saldo=(v.saldo!=null)?v.saldo:Math.max(0,v.monto-abono);
+    tot.ingLibresPag+=(v.monto-saldo); tot.ingLibresFiado+=saldo;
   });
   tot.gastos = j.gastos.reduce((s,g)=>s+g.monto,0);
   tot.devoluciones = (j.devoluciones||[]).reduce((s,d)=>s+d.monto,0);
-
-  // Caja esperada (lo que debería haber en efectivo)
-  (j.libres||[]).forEach(v=>{ if(v.estado==='fiado') tot.ingLibresFiado+=v.monto; else tot.ingLibresPag+=v.monto; });
-  tot.efectivoEsperado = tot.ingMenudeo + tot.ingMayoreoPag + tot.ingCombo + tot.ingLibresPag - tot.gastos - tot.devoluciones;
-  // Ganancia neta del día (ventas totales - costo - regalos - merma - gastos)
-  tot.ventasTotales = tot.ingMenudeo + tot.ingMayoreoPag + tot.ingMayoreoFiado + tot.ingCombo + tot.ingLibresPag + tot.ingLibresFiado;
-  tot.gananciaNeta  = tot.ventasTotales - tot.costoVendido - tot.costoRegalo - tot.costoMerma - tot.gastos - tot.devoluciones;
+  tot.efectivoEsperado = tot.ingMayoreoPag + tot.ingLibresPag - tot.gastos - tot.devoluciones;
+  tot.ventasTotales = tot.ingMayoreoPag + tot.ingMayoreoFiado + tot.ingLibresPag + tot.ingLibresFiado;
+  tot.gananciaNeta  = tot.ventasTotales - tot.costoVendido - tot.costoMerma - tot.gastos - tot.devoluciones;
   return {porProd, tot};
 }
 
@@ -430,7 +408,6 @@ function viewRouter(){
     case 'cobros': return vCobros();
     case 'ajustes': return vAjustes();
     case 'informe': return vInforme();
-    case 'abrir': return vAbrir();
     case 'form': return vForm();
     default: return vInicio();
   }
@@ -445,9 +422,8 @@ function alertaInsumos(){
 function vInicio(){
   const j=DB.jornada;
   let ingresos=0, egresos=0, tot=null;
-  if(j){ tot=calcular(j,null).tot; ingresos=tot.ingMayoreoPag+(tot.ingLibresPag||0)+tot.ingCombo; egresos=tot.gastos+(tot.devoluciones||0); }
+  if(j){ tot=calcular(j).tot; ingresos=tot.ingMayoreoPag+(tot.ingLibresPag||0); egresos=tot.gastos+(tot.devoluciones||0); }
   const balance=ingresos-egresos;
-  const hayEntrega=!!(j&&Object.values(j.entregas||{}).some(q=>q>0));
   const fiadoHoy=j?(j.mayoreo.filter(m=>m.estado==='fiado').reduce((s,m)=>s+m.qty*m.precio,0)+(j.libres||[]).filter(v=>v.estado==='fiado').reduce((s,v)=>s+v.monto,0)):0;
   return `<div class="view-title">${j?'Hoy':'Buen día'}</div>
     <div class="view-sub">${fmtFecha(today())}${j?` · atiende ${nombreUsuario(j.trabajadorId)}`:''}</div>
@@ -458,7 +434,6 @@ function vInicio(){
       <div class="row"><div><span class="sub">↗ Ingresos cobrados hoy</span></div><div class="val" style="color:var(--verde)">${$(ingresos)}</div></div>
       <div class="row"><div><span class="sub">↘ Egresos (gastos)</span></div><div class="val" style="color:var(--coral)">${$(egresos)}</div></div>
       ${fiadoHoy?`<div class="row"><div><span class="sub">Quedó fiado hoy</span></div><div class="val" style="color:var(--mango-text)">${$(fiadoHoy)}</div></div>`:''}
-      ${hayEntrega?`<div class="hint">El menudeo de la entrega entra al hacer el cierre.</div>`:''}
     </div>
     <div class="btnrow">
       <button class="btn btn-verde" style="font-size:17px;padding:20px" onclick="App.form('mayoreo')">${svg('users')} Vender al por mayor</button>
@@ -468,46 +443,15 @@ function vInicio(){
       <button class="btn btn-rojo" onclick="App.nuevoGasto()">− Gasto</button>
     </div>
     <div style="height:14px"></div>
-    ${hayEntrega?`<div class="card hero">
-      <h3>Entregado esta mañana</h3>
-      <div class="big">${Object.values(j.entregas).reduce((s,q)=>s+q,0)} <span style="font-size:18px;font-weight:600">und</span></div>
-      <div class="biglab">${$(Object.entries(j.entregas).reduce((s,[id,q])=>s+q*prod(id).menudeo,0))} a precio de menudeo</div>
-      <div class="grid2">
-        <div class="mini"><b>${tot.mayoreoU} und</b><span>Mayoreo</span></div>
-        <div class="mini"><b>${tot.mermaU} und</b><span>Merma</span></div>
-      </div>
-    </div>
-    <button class="btn btn-dark" onclick="App.go('cierre')">${svg('lock')} Guardar / archivar el día</button>`
-    :`<div class="card"><h3>Método antiguo (entrega + liquidación)</h3>
-      <p style="color:var(--ink-soft);font-size:13px;margin-bottom:12px">Solo si hoy vas a entregar mercancía en la mañana para liquidarla en la tarde. Pide una clave.</p>
-      <button class="btn btn-line" onclick="App.abrirMetodoAntiguo()">Abrir método de entrega</button></div>
-    ${j?`<button class="btn btn-dark" onclick="App.go('cierre')">${svg('lock')} Guardar / archivar el día</button>`:''}`}
+    ${j?`<button class="btn btn-dark" onclick="App.go('cierre')">${svg('lock')} Guardar / archivar el día</button>`
+    :`<div class="card"><h3>Empieza aquí</h3>
+      <p style="color:var(--ink-soft);font-size:13px;margin-bottom:12px">Crea tus productos y arranca a vender al por mayor.</p>
+      <button class="btn btn-line" onclick="App.go('ajustes');App.sub('prod')">Crear productos</button></div>`}
     ${DB.historial.length?`<div class="seclabel">Últimos cierres</div>${listaHistorial(3)}`:''}`;
 }
 const nombreUsuario = id => (DB.usuarios.find(u=>u.id===id)||{}).nombre||'—';
-const disponible = pid => {
-  const j=DB.jornada; if(!j) return 0;
-  const ent=(j.entregas&&j.entregas[pid])||0;
-  const may=j.mayoreo.filter(m=>m.prodId===pid).reduce((s,m)=>s+m.qty,0);
-  let comb=0; j.combos.forEach(cv=>{const cb=combo(cv.comboId); if(cb.prodId===pid) comb+=(cb.gatillo+cb.bono)*cv.qty;});
-  const mer=j.mermas.filter(m=>m.prodId===pid).reduce((s,m)=>s+m.qty,0);
-  return ent - may - comb - mer;
-};
+function nuevaJornada(){ return {id:uid(),fecha:today(),trabajadorId:S.user.id,estado:'abierta',mayoreo:[],mermas:[],gastos:[],libres:[],devoluciones:[],cierre:null}; }
 
-/* ------------------------------- ABRIR DÍA ------------------------------- */
-function vAbrir(){
-  const rows = DB.productos.filter(p=>p.activo).map(p=>`
-    <div class="qr"><div class="nm">${p.nombre}<small>Menudeo ${$(p.menudeo)} · Mayoreo ${$(p.mayoreo)}</small></div>
-      <input type="number" min="0" inputmode="numeric" id="ent_${p.id}" placeholder="0"></div>`).join('');
-  return `<div class="view-title">Entrega del día</div>
-    <div class="view-sub">¿Cuánto se entrega esta mañana de cada cosa?</div>
-    <div class="card qtygrid"><h3>Cantidades entregadas</h3>${rows}</div>
-    <button class="btn btn-primary" onclick="App.abrirDia()">Abrir el día con esta entrega</button>
-    <div style="height:8px"></div>
-    <button class="btn btn-ghost" onclick="App.abrirSinEntrega()">Abrir sin entrega (solo ventas libres)</button>
-    <div style="height:8px"></div>
-    <button class="btn btn-line" onclick="App.go('inicio')">Cancelar</button>`;
-}
 
 /* ------------------------------- REGISTRAR ------------------------------- */
 function vRegistrar(){
@@ -519,23 +463,22 @@ function vRegistrar(){
       <button class="tile hoja" onclick="App.form('libre')"><div class="ico">${svg('money')}</div><b>Venta libre</b><span>Cliente y valor, sin escoger productos</span></button>
       <button class="tile" onclick="App.form('coti')"><div class="ico">${svg('tag')}</div><b>Cotización</b><span>Pásale el precio al cliente</span></button>
       <button class="tile aji" onclick="App.form('merma')"><div class="ico">${svg('warn')}</div><b>Producto dañado</b><span>Merma del día</span></button>
-      <button class="tile" onclick="App.form('combo')"><div class="ico">${svg('tag')}</div><b>Combo</b><span>Lleva más, paga menos</span></button>
       <button class="tile" onclick="App.form('gasto')"><div class="ico">${svg('money')}</div><b>Gasto</b><span>Hielo, aceite, gas…</span></button>
       <button class="tile aji" onclick="App.form('devolucion')"><div class="ico">${svg('warn')}</div><b>Devolución</b><span>Plata que devolviste</span></button>
     </div>
-    ${j?resumenRegistros():`<div class="card" style="margin-top:14px"><h3>Método antiguo (entrega + liquidación)</h3><p style="color:var(--ink-soft);font-size:13px;margin-bottom:12px">Solo si hoy vas a entregar mercancía para liquidarla. Pide una clave.</p><button class="btn btn-line" onclick="App.abrirMetodoAntiguo()">Abrir método de entrega</button></div>`}`;
+    <div class="card" style="margin-top:6px"><h3>Productos</h3><p style="color:var(--ink-soft);font-size:13px;margin-bottom:12px">¿Falta un producto para vender? Créalo o edítalo aquí.</p><button class="btn btn-line" onclick="App.go('ajustes');App.sub('prod')">Crear o editar productos</button></div>
+    ${j?resumenRegistros():''}`;
 }
 function resumenRegistros(){
   const j=DB.jornada; const items=[];
-  (j.libres||[]).forEach(v=>{let pg;if(v.estado==='fiado'){pg='<span class="pill f">Fiado</span>';}else{const pt=[];if(v.efectivo)pt.push($(v.efectivo)+' efectivo');if(v.transferencia)pt.push($(v.transferencia)+' transf.');pg='<span class="pill v">'+(pt.join(' + ')||'Pagado')+'</span>';}
+  (j.libres||[]).forEach(v=>{let pg;const _ab=(v.efectivo||0)+(v.transferencia||0);const _sd=(v.saldo!=null)?v.saldo:Math.max(0,v.monto-_ab);if(_sd>0){pg=_ab>0?'<span class="pill p">Abonó '+$(_ab)+' · debe '+$(_sd)+'</span>':'<span class="pill f">Fiado</span>';}else{const pt=[];if(v.efectivo)pt.push($(v.efectivo)+' efectivo');if(v.transferencia)pt.push($(v.transferencia)+' transf.');pg='<span class="pill v">'+(pt.join(' + ')||'Pagado')+'</span>';}
     let verif='';
     if(v.transferencia>0){ verif=esAdmin()?`<div><button class="btn btn-sm ${v.verificada?'btn-ghost':'btn-line'}" style="margin-top:6px" onclick="App.toggleVerif('${v.id}')">${v.verificada?'✓ Transferencia verificada':'Verificar transferencia'}</button></div>`:(v.verificada?'<div><span class="pill v" style="margin-top:6px">✓ Verificada</span></div>':''); }
     items.push({t:'Venta libre'+(v.referencia?' · Ref. '+v.referencia:''),d:(v.clienteId?cliente(v.clienteId).nombre:'Venta rápida')+(v.concepto?' · '+v.concepto:''),v:$(v.monto),p:pg,extra:verif,x:`App.delRegistro('libre','${v.id}')`,r:`App.compartirRecibo('libre','${v.id}')`});});
-  j.mayoreo.forEach(m=>{let pg;if(m.estado==='fiado'){pg='<span class="pill f">Fiado</span>';}else{const pt=[];if(m.efectivo)pt.push($(m.efectivo)+' efectivo');if(m.transferencia)pt.push($(m.transferencia)+' transf.');pg='<span class="pill v">'+(pt.join(' + ')||'Pagado')+'</span>';}
+  j.mayoreo.forEach(m=>{let pg;const _ab=(m.efectivo||0)+(m.transferencia||0);const _sd=(m.saldo!=null)?m.saldo:Math.max(0,m.qty*m.precio-_ab);if(_sd>0){pg=_ab>0?'<span class="pill p">Abonó '+$(_ab)+' · debe '+$(_sd)+'</span>':'<span class="pill f">Fiado</span>';}else{const pt=[];if(m.efectivo)pt.push($(m.efectivo)+' efectivo');if(m.transferencia)pt.push($(m.transferencia)+' transf.');pg='<span class="pill v">'+(pt.join(' + ')||'Pagado')+'</span>';}
     let verif='';
     if(m.transferencia>0){ verif=esAdmin()?`<div><button class="btn btn-sm ${m.verificada?'btn-ghost':'btn-line'}" style="margin-top:6px" onclick="App.toggleVerif('${m.id}')">${m.verificada?'✓ Transferencia verificada':'Verificar transferencia'}</button></div>`:(m.verificada?'<div><span class="pill v" style="margin-top:6px">✓ Verificada</span></div>':''); }
     items.push({t:'Venta al por mayor'+(m.referencia?' · Ref. '+m.referencia:''),d:`${m.qty} × ${prod(m.prodId).nombre} · ${cliente(m.clienteId).nombre}`,v:$(m.qty*m.precio),p:pg,extra:verif,x:`App.delRegistro('mayoreo','${m.id}')`,r:`App.compartirRecibo('mayoreo','${m.id}')`});});
-  j.combos.forEach(c=>{const cb=combo(c.comboId);items.push({t:'Combo',d:`${c.qty} × ${cb.nombre}`,v:`+${cb.bono*c.qty} regaladas`,p:'<span class="pill g">Combo</span>',x:`App.delRegistro('combo','${c.id}')`});});
   j.mermas.forEach(m=>items.push({t:'Producto dañado (merma)',d:`${m.qty} × ${prod(m.prodId).nombre}`,v:'',p:m.confirmada?'<span class="pill v">Confirmada</span>':'<span class="pill p">Sin confirmar</span>',x:`App.delRegistro('merma','${m.id}')`}));
   j.gastos.forEach(g=>items.push({t:'Gasto',d:g.concepto,v:'−'+$(g.monto),p:'',x:`App.delRegistro('gasto','${g.id}')`}));
   (j.devoluciones||[]).forEach(d=>items.push({t:'Devolución',d:(d.clienteId?cliente(d.clienteId).nombre:'')+(d.concepto?(d.clienteId?' · ':'')+d.concepto:'')||'Devolución',v:'−'+$(d.monto),p:'<span class="pill f">Egreso</span>',x:`App.delRegistro('devolucion','${d.id}')`}));
@@ -577,12 +520,12 @@ function vForm(){
           <div style="display:flex;gap:8px"><select id="l_cli" style="flex:1"><option value="">Sin cliente</option>${DB.clientes.map(c=>`<option value="${c.id}" ${tmp.clienteId===c.id?'selected':''}>${c.nombre}</option>`).join('')}</select>
           <button class="btn btn-sm btn-ghost" style="width:auto" onclick="App.libreNuevoCliente()">+ Nuevo</button></div></label>
         <label class="fld"><span>¿Qué se llevó? <span style="font-weight:500;text-transform:none">(opcional)</span></span><input type="text" id="l_conc" value="${tmp.concepto||''}" placeholder="Ej. 100 empanadas y 50 papas"></label>
-        <label class="fld"><span>Pago</span><select id="f_estado" onchange="App.mayoreoEstado()"><option value="pagado">Pagado ahora</option><option value="fiado" ${tmp.estado==='fiado'?'selected':''}>Fiado (queda debiendo)</option></select></label>
-        <div id="f_pagobox">
-        <label class="fld"><span>Efectivo</span><input type="number" min="0" inputmode="numeric" id="f_efec" placeholder="0" oninput="App.mayoreoSplit('ef')"></label>
-        <label class="fld" style="margin-bottom:6px"><span>Transferencia / Nequi</span><input type="number" min="0" inputmode="numeric" id="f_transf" placeholder="0" oninput="App.mayoreoSplit('tr')"></label>
-        <div class="hint">Escribe uno y el otro se completa solo (suma el valor total).</div>
-        <label class="fld" style="margin-top:10px"><span>Referencia <span style="font-weight:500;text-transform:none">(si hubo transferencia)</span></span><input type="text" id="f_ref" placeholder="N.º de referencia"></label>
+        <div style="border-top:1px solid var(--line-soft);margin-top:4px;padding-top:14px">
+        <div class="seclabel" style="margin:0 0 12px">¿Cuánto paga ahora?</div>
+        <label class="fld"><span>Efectivo</span><input type="number" min="0" inputmode="numeric" id="f_efec" placeholder="0" oninput="App.libreSaldo()"></label>
+        <label class="fld"><span>Transferencia / Nequi</span><input type="number" min="0" inputmode="numeric" id="f_transf" placeholder="0" oninput="App.libreSaldo()"></label>
+        <label class="fld"><span>Referencia <span style="font-weight:500;text-transform:none">(si hubo transferencia)</span></span><input type="text" id="f_ref" placeholder="N.º de referencia"></label>
+        <div id="f_saldo" class="hint"></div>
         </div>
       </div>
       <button class="btn btn-primary" onclick="App.saveLibre()">Guardar venta</button>${back}`;
@@ -591,31 +534,21 @@ function vForm(){
     return `<div class="view-title">Venta al por mayor</div><div class="view-sub">Toda venta mayoreo va a nombre de un cliente.</div>
       <div class="card">
         <label class="fld"><span>Cliente</span><div style="display:flex;gap:8px"><select id="f_cli" style="flex:1">${opciones(DB.clientes)}</select><button class="btn btn-ghost btn-sm" style="width:auto" onclick="App.nuevoClienteRapido()">+ Nuevo</button></div></label>
-        <label class="fld"><span>Producto</span><select id="f_prod" onchange="App.mayoreoPrecio()">${DB.productos.filter(p=>p.activo).map(p=>`<option value="${p.id}">${p.nombre}</option>`).join('')}</select><div class="hint" id="f_disp"></div></label>
+        <label class="fld"><span>Producto</span><select id="f_prod" onchange="App.mayoreoPrecio()">${DB.productos.filter(p=>p.activo).map(p=>`<option value="${p.id}">${p.nombre}</option>`).join('')}</select><div class="hint">¿Falta un producto? Créalo en Ajustes → Productos.</div></label>
         <label class="fld"><span>Cantidad</span><input type="number" min="1" inputmode="numeric" id="f_qty" value="1" oninput="App.mayoreoPrecio()"></label>
-        <label class="fld"><span>Precio unitario (mayoreo)</span><input type="number" min="0" inputmode="numeric" id="f_precio"><div class="hint" id="f_tot"></div></label>
-        <label class="fld"><span>Pago</span><select id="f_estado" onchange="App.mayoreoEstado()"><option value="pagado">Pagado ahora</option><option value="fiado">Fiado (queda debiendo)</option></select></label>
-        <div id="f_pagobox">
-        <label class="fld"><span>Efectivo</span><input type="number" min="0" inputmode="numeric" id="f_efec" placeholder="0" oninput="App.mayoreoSplit('ef')"></label>
-        <label class="fld" style="margin-bottom:6px"><span>Transferencia / Nequi</span><input type="number" min="0" inputmode="numeric" id="f_transf" placeholder="0" oninput="App.mayoreoSplit('tr')"></label>
-        <div class="hint">Escribe uno y el otro se completa solo (suma el total de la venta).</div>
-        <label class="fld" style="margin-top:10px"><span>Referencia <span style="font-weight:500;text-transform:none">(si hubo transferencia)</span></span><input type="text" id="f_ref" placeholder="N.º de referencia"></label>
+        <label class="fld"><span>Precio unitario (mayoreo)</span><input type="number" min="0" inputmode="numeric" id="f_precio" oninput="this.dataset.touched=1;App.mayoreoPrecio()"><div class="hint" id="f_tot"></div></label>
+        <div style="border-top:1px solid var(--line-soft);margin-top:4px;padding-top:14px">
+        <div class="seclabel" style="margin:0 0 12px">¿Cuánto paga ahora?</div>
+        <label class="fld"><span>Efectivo</span><input type="number" min="0" inputmode="numeric" id="f_efec" placeholder="0" oninput="App.mayoreoSaldo()"></label>
+        <label class="fld"><span>Transferencia / Nequi</span><input type="number" min="0" inputmode="numeric" id="f_transf" placeholder="0" oninput="App.mayoreoSaldo()"></label>
+        <label class="fld"><span>Referencia <span style="font-weight:500;text-transform:none">(si hubo transferencia)</span></span><input type="text" id="f_ref" placeholder="N.º de referencia"></label>
+        <div id="f_saldo" class="hint"></div>
         </div>
       </div>
       <button class="btn btn-primary" onclick="App.saveMayoreo()">Guardar venta</button>${back}`;
   }
-  if(t==='combo'){
-    if(!DB.combos.filter(c=>c.activo).length) return `<div class="view-title">Combo</div><div class="empty">${svg('empty')}<div>No hay combos creados.<br>Créalos en Ajustes → Combos.</div></div>${back}`;
-    return `<div class="view-title">Combo</div><div class="view-sub">Las unidades regaladas se calculan solas.</div>
-      <div class="card">
-        <label class="fld"><span>Combo</span><select id="f_combo" onchange="App.comboInfo()">${opciones(DB.combos.filter(c=>c.activo))}</select></label>
-        <label class="fld"><span>¿Cuántos combos?</span><input type="number" min="1" inputmode="numeric" id="f_qty" value="1" oninput="App.comboInfo()"></label>
-        <div class="hint" id="f_cinfo" style="font-size:13px"></div>
-      </div>
-      <button class="btn btn-primary" onclick="App.saveCombo()">Guardar combo</button>${back}`;
-  }
   if(t==='merma'){
-    return `<div class="view-title">Merma</div><div class="view-sub">Producto dañado o vencido. Debe entregarse físico al cierre.</div>
+    return `<div class="view-title">Producto dañado</div><div class="view-sub">Producto que se dañó o que te devolvió un revendedor dañado. Cuenta como pérdida del día.</div>
       <div class="card">
         <label class="fld"><span>Producto</span><select id="f_prod" onchange="App.mermaInfo()">${opciones(DB.productos.filter(p=>p.activo))}</select><div class="hint" id="f_disp"></div></label>
         <label class="fld"><span>Cantidad dañada</span><input type="number" min="1" inputmode="numeric" id="f_qty" value="1"></label>
@@ -721,25 +654,12 @@ function vForm(){
       <button class="btn btn-primary" onclick="App.saveCli()">Guardar cliente</button>
       ${id?`<div style="height:8px"></div><button class="btn btn-danger" onclick="App.delCli('${id}')">Eliminar cliente</button>`:''}${backAj}`;
   }
-  if(t==='comboedit'){
-    const id=S.ctx.editId; const c=id?combo(id):{prodId:(DB.productos[0]||{}).id,gatillo:'',bono:''};
-    return `<div class="view-title">${id?'Editar combo':'Nuevo combo'}</div><div class="view-sub">Ej: paga 10 y lleva 12 (2 de regalo).</div>
-      <div class="card">
-        <label class="fld"><span>Producto</span><select id="cb_prod">${DB.productos.map(p=>`<option value="${p.id}" ${p.id===c.prodId?'selected':''}>${p.nombre}</option>`).join('')}</select></label>
-        <label class="fld"><span>Cuantas paga el cliente</span><input type="number" min="1" inputmode="numeric" id="cb_gat" value="${c.gatillo||''}" placeholder="10"></label>
-        <label class="fld"><span>Cuantas de regalo</span><input type="number" min="0" inputmode="numeric" id="cb_bon" value="${c.bono||''}" placeholder="2"></label>
-      </div>
-      <button class="btn btn-primary" onclick="App.saveComboCfg()">Guardar combo</button>
-      ${id?`<div style="height:8px"></div><button class="btn btn-danger" onclick="App.delCombo('${id}')">Eliminar combo</button>`:''}${backAj}`;
-  }
 }
 
 let _espCierre=0, _lastPago='tr';
 function cierreRecalc(){
   const j=DB.jornada; if(!j) return;
-  const q={};
-  Object.keys(j.entregas).forEach(id=>{ if(j.entregas[id]>0){ const el=document.getElementById('q_'+id); q[id]=el?(parseInt(el.value)||0):0; } });
-  const {tot}=calcular(j,q);
+  const {tot}=calcular(j);
   _espCierre=Math.max(0,Math.round(tot.efectivoEsperado));
   const t=document.getElementById('c_total'); if(t) t.textContent=$(_espCierre);
   cierreSplit(_lastPago,false);
@@ -763,39 +683,34 @@ function mayoreoRebalance(){
 function vCierre(){
   const j=DB.jornada;
   if(!j) return noDia();
-  const rows=Object.keys(j.entregas).filter(id=>j.entregas[id]>0).map(id=>{
-    const p=prod(id);
-    return `<div class="qr"><div class="nm">${p.nombre}<small>Se entregaron ${j.entregas[id]}</small></div>
-      <input type="number" min="0" inputmode="numeric" id="q_${id}" placeholder="0" oninput="App.recalcCierre()"></div>`;
-  }).join('');
-  const pend=(j.mayoreo.filter(m=>m.estado==='fiado').length+(j.libres||[]).filter(v=>v.estado==='fiado').length);
+  const {tot}=calcular(j,null);
+  const cobrado=tot.ingMayoreoPag+(tot.ingLibresPag||0);
+  const fiadoDia=tot.ingMayoreoFiado+(tot.ingLibresFiado||0);
   return `<div class="view-title">Guardar el día</div>
-    <div class="view-sub">${pend?`Hay ${pend} pago(s) pendiente(s): el día se guarda pero queda abierto para cuando paguen.`:'Todo está pago — puedes archivar el día.'}</div>
-    ${rows?`<div class="card qtygrid"><h3>¿Cuánto quedó de cada uno?</h3>${rows}</div>`:`<div class="card"><h3>Día de ventas libres</h3><p style="color:var(--ink-soft);font-size:13px">Hoy no hubo entrega de productos — solo cuadra la plata.</p></div>`}
-    <div class="card"><h3>Cómo entró la plata</h3>
-      <div class="row" style="border:none;padding:0 0 10px"><div class="lab">Total de la venta</div><div class="val" id="c_total">${$(0)}</div></div>
-      <label class="fld"><span>Efectivo</span><input type="number" min="0" inputmode="numeric" id="q_efectivo" placeholder="0" oninput="App.splitPago('ef')"></label>
-      <label class="fld" style="margin-bottom:6px"><span>Transferencia / Nequi</span><input type="number" min="0" inputmode="numeric" id="q_transfer" placeholder="0" oninput="App.splitPago('tr')"></label>
-      <div class="hint">Escribe uno y el otro se completa solo. Si falta plata, el cuadre lo detecta.</div>
+    <div class="view-sub">Revisa el resumen y archívalo. El día también se archiva solo al abrir uno nuevo.</div>
+    <div class="statgrid">
+      <div class="stat pos"><b>${$(tot.gananciaNeta)}</b><span>Ganancia del día</span></div>
+      <div class="stat"><b>${$(tot.ventasTotales)}</b><span>Venta del día</span></div>
+      <div class="stat"><b>${$(cobrado)}</b><span>Cobrado hoy</span></div>
+      <div class="stat ${fiadoDia?'neg':''}"><b>${$(fiadoDia)}</b><span>Quedó fiado</span></div>
     </div>
-    ${pend?`<button class="btn btn-primary" onclick="App.calcularCierre(false)">Guardar día (queda pendiente)</button>
-    <div class="hint" style="text-align:center;margin-top:8px">Cuando todos paguen, entras al día y lo archivas.</div>`
-    :`<button class="btn btn-dark" onclick="App.calcularCierre(true)">${svg('lock')} Archivar día</button>`}`;
+    ${fiadoDia?`<div class="warnbox" style="background:var(--mango-tint);border-color:#F5D9AE;color:var(--mango-text)">${svg('warn')} Hay ${$(fiadoDia)} en fiados. Puedes archivar igual — las deudas siguen vivas en Deudas hasta que paguen.</div>`:''}
+    <button class="btn btn-dark" onclick="App.calcularCierre(true)">${svg('lock')} Archivar día y ver informe</button>
+    <div class="hint" style="text-align:center;margin-top:10px">Al archivar, el día queda guardado en el historial.</div>`;
 }
 
 /* -------------------------------- INFORME -------------------------------- */
 function vInforme(){
   const j = S.ctx.jornada;
   if(!j) return noDia();
-  const {porProd,tot}=calcular(j, j.cierre.quedante);
-  const dif = j.cierre.diferencia;
+  const {porProd,tot}=calcular(j);
+  const dif = j.cierre.diferencia||0;
   const cuadro = Math.abs(dif)<1;
   const ranking = Object.entries(porProd).map(([id,d])=>{
-    const P=prod(id); const vend=(Math.max(0,d.menU||0))+d.mayU+d.cPag;
-    const gan = (Math.max(0,d.menU||0))*(P.menudeo-P.costo)+d.mayU*(P.mayoreo-P.costo)+d.cPag*(P.menudeo-P.costo);
-    return {nombre:P.nombre,vend,gan,merma:d.mermaU,reg:d.cReg};
+    const P=prod(id); const vend=d.mayU;
+    const gan = d.mayU*(P.mayoreo-P.costo);
+    return {nombre:P.nombre,vend,gan,merma:d.mermaU};
   }).sort((a,b)=>b.vend-a.vend);
-  const totalRegVal = Object.entries(porProd).reduce((s,[id,d])=>s+d.cReg*prod(id).menudeo,0);
 
   setTimeout(()=>drawChart(ranking),30);
   const editar = (S.ctx.from==='historial'&&esAdmin())?`<button class="btn btn-line" onclick="App.editarDiaPasado('${j.id}')">Corregir este día (fiados, pagos…)</button><div style="height:8px"></div>`:'';
@@ -810,15 +725,6 @@ function vInforme(){
   return `<div class="view-title">Informe del ${fmtFecha(j.fecha)}</div>
     <div class="view-sub">${j.cierre.pendiente?'Guardado · faltan pagos':'Archivado'} · ${nombreUsuario(j.trabajadorId)}${j.cierre.editado?' · corregido':''}</div>
     ${j.cierre.pendiente?`<div class="warnbox" style="background:var(--mango-tint);border-color:#F5D9AE;color:var(--mango-text)">${svg('warn')} Este día está guardado pero aún abierto: falta que ${fiadosDia.length} pago(s) entren para poder archivarlo.</div>`:''}
-    <div class="result ${cuadro?'ok':'bad'}">
-      <div class="lbl">${cuadro?'Caja cuadrada':(dif<0?'Faltó plata':'Sobró plata')}</div>
-      <div class="num">${cuadro?'✓':$(Math.abs(dif))}</div>
-      <div class="msg">Esperado ${$(j.cierre.efectivoEsperado)} · Entregado ${$(j.cierre.efectivoEntregado)}</div>
-    </div>
-    ${j.cierre.efectivo!==undefined?`<div class="card"><h3>Cómo entró la plata</h3>
-      <div class="row"><div class="lab">Efectivo</div><div class="val">${$(j.cierre.efectivo)}</div></div>
-      <div class="row"><div class="lab">Transferencia / Nequi</div><div class="val">${$(j.cierre.transfer)}</div></div>
-    </div>`:''}
     ${[...j.mayoreo,...(j.libres||[])].some(m=>m.transferencia>0)?`<div class="card"><h3>Transferencias del día</h3>${[...j.mayoreo,...(j.libres||[])].filter(m=>m.transferencia>0).map(m=>`
       <div class="row"><div><div class="lab">${m.clienteId?cliente(m.clienteId).nombre:'Venta libre'}</div><div class="sub">${m.referencia?('Ref. '+m.referencia):'Sin referencia'}</div></div>
       <div style="text-align:right"><div class="val">${$(m.transferencia)}</div>${m.verificada?'<span class="pill v">Verificada</span>':'<span class="pill p">Por verificar</span>'}</div></div>`).join('')}</div>`:''}
@@ -837,16 +743,12 @@ function vInforme(){
       <div class="stat pos"><b>${$(tot.gananciaNeta)}</b><span>Ganancia del día</span></div>
       <div class="stat"><b>${$(tot.ventasTotales)}</b><span>Ventas totales</span></div>
       <div class="stat"><b>${$(tot.gastos)}</b><span>Gastos</span></div>
-      <div class="stat neg"><b>${$(totalRegVal + tot.costoMerma)}</b><span>Regalado + merma</span></div>
+      <div class="stat neg"><b>${$(tot.costoMerma)}</b><span>Merma (costo)</span></div>
     </div>
     <div class="card"><h3>Unidades vendidas por producto</h3><div class="chartwrap"><canvas id="chart"></canvas></div></div>
     <div class="card"><h3>Detalle por producto</h3>
-      ${ranking.map(r=>`<div class="row"><div><div class="lab">${r.nombre}</div><div class="sub">${r.merma?`${r.merma} dañadas · `:''}${r.reg?`${r.reg} regaladas`:''}</div></div>
+      ${ranking.map(r=>`<div class="row"><div><div class="lab">${r.nombre}</div><div class="sub">${r.merma?`${r.merma} dañadas`:''}</div></div>
         <div style="text-align:right"><div class="val">${r.vend} vend.</div><div class="sub">${$(r.gan)} gcia.</div></div></div>`).join('')}
-    </div>
-    <div class="card"><h3>Lo que se regaló (combos)</h3>
-      <div class="row"><div class="lab">Unidades regaladas</div><div class="val">${tot.comboRegU} und</div></div>
-      <div class="row"><div class="lab">Valor regalado</div><div class="val">${$(totalRegVal)}</div></div>
     </div>
     ${editar}${share}${back}`;
 }
@@ -961,7 +863,6 @@ function vAjustes(){
   return `<div class="view-title">Ajustes</div><div class="view-sub">Configuración del negocio.</div>
     <div class="tiles">
       <button class="tile" onclick="App.sub('prod')"><div class="ico">${svg('box')}</div><b>Productos</b><span>Precios y costo</span></button>
-      <button class="tile hoja" onclick="App.sub('combo')"><div class="ico">${svg('tag')}</div><b>Combos</b><span>Bonificaciones</span></button>
       <button class="tile" onclick="App.sub('cli')"><div class="ico">${svg('users')}</div><b>Clientes</b><span>Para el mayoreo</span></button>
       <button class="tile" onclick="App.sub('emp')"><div class="ico">${svg('users')}</div><b>Empleados</b><span>Accesos y PIN</span></button>
       <button class="tile" onclick="App.sub('hist')"><div class="ico">${svg('clock')}</div><b>Historial</b><span>Días cerrados</span></button>
@@ -971,7 +872,6 @@ function vAjustes(){
       <button class="tile hoja" onclick="App.sub('neg')"><div class="ico">${svg('tag')}</div><b>Mi negocio</b><span>Datos de la factura</span></button>
     </div>
     ${S.sub==='prod'?panelProductos():''}
-    ${S.sub==='combo'?panelCombos():''}
     ${S.sub==='cli'?panelClientes():''}
     ${S.sub==='emp'?panelEmpleados():''}
     ${S.sub==='ins'?panelInsumos():''}
@@ -994,10 +894,6 @@ function panelNegocio(){
     <div class="card"><h3>Tu clave de administrador</h3>
       <p class="hint" style="margin:0 0 12px">Es el PIN con el que entras como dueño. Cámbialo cuando quieras.</p>
       <button class="btn btn-line" onclick="App.cambiarClave()">Cambiar mi clave de entrada</button>
-    </div>
-    <div class="card"><h3>Método antiguo (entrega + liquidación)</h3>
-      <p class="hint" style="margin:0 0 12px">La clave que protege el método de entrega, para que no se use por error. Por defecto: <b>2580</b>.</p>
-      <button class="btn btn-line" onclick="App.cambiarPinMetodo()">Cambiar clave del método de entrega</button>
     </div>`;
 }
 function panelResumen(){
@@ -1007,10 +903,9 @@ function panelResumen(){
   const agg=n=>{
     const js=DB.historial.filter(j=>dias(j.fecha)<n);
     let ventas=0,gan=0,gastos=0,falt=0; const porProd={};
-    js.forEach(j=>{ const {porProd:pp,tot}=calcular(j,j.cierre.quedante);
+    js.forEach(j=>{ const {porProd:pp,tot}=calcular(j);
       ventas+=tot.ventasTotales; gan+=tot.gananciaNeta; gastos+=tot.gastos;
-      if(j.cierre.diferencia<0) falt+=-j.cierre.diferencia;
-      Object.entries(pp).forEach(([id,d])=>{ porProd[id]=(porProd[id]||0)+Math.max(0,d.menU||0)+d.mayU+d.cPag; });
+      Object.entries(pp).forEach(([id,d])=>{ porProd[id]=(porProd[id]||0)+d.mayU; });
     });
     return {n:js.length,ventas,gan,gastos,falt,js,top:Object.entries(porProd).sort((a,b)=>b[1]-a[1]).slice(0,3)};
   };
@@ -1025,7 +920,7 @@ function panelResumen(){
   if(S.ctx.rDesde||S.ctx.rHasta){
     const todas=[...DB.historial,...(DB.jornada?[DB.jornada]:[])].filter(j=>j.fecha>=dDesde&&j.fecha<=dHasta);
     let fV=0,fMay=0,fMayN=0,fGas=0,fDev=0,fGan=0; const mayList=[],gasList=[];
-    todas.forEach(j=>{ const {tot}=calcular(j,(j.cierre&&j.cierre.quedante)||null);
+    todas.forEach(j=>{ const {tot}=calcular(j);
       fV+=tot.ventasTotales; fGas+=tot.gastos; fDev+=(tot.devoluciones||0); fGan+=tot.gananciaNeta;
       j.mayoreo.forEach(m=>{ fMay+=m.qty*m.precio; fMayN++; mayList.push({f:j.fecha,c:m.clienteId?cliente(m.clienteId).nombre:'—',d:m.qty+' × '+prod(m.prodId).nombre,v:m.qty*m.precio,fiado:m.estado==='fiado'}); });
       j.gastos.forEach(g=>gasList.push({f:j.fecha,d:g.concepto,v:g.monto}));
@@ -1107,13 +1002,6 @@ function panelProductos(){
       <button class="btn btn-sm btn-line" onclick="App.editProd('${p.id}')">Editar</button></div></div>`).join('')}
     <button class="btn btn-ghost" onclick="App.editProd(null)">${svg('plus')} Nuevo producto</button>`;
 }
-function panelCombos(){
-  return `<div class="seclabel">Combos</div>${DB.combos.map(c=>`
-    <div class="card"><div class="row" style="border:none">
-      <div><div class="lab">${c.nombre}</div><div class="sub">${prod(c.prodId).nombre} · lleva ${c.gatillo+c.bono} paga ${c.gatillo} (${c.bono} gratis)</div></div>
-      <button class="btn btn-sm btn-line" onclick="App.editCombo('${c.id}')">Editar</button></div></div>`).join('')||'<div class="empty">Sin combos.</div>'}
-    <button class="btn btn-ghost" onclick="App.editCombo(null)">${svg('plus')} Nuevo combo</button>`;
-}
 function panelClientes(){
   return `<div class="seclabel">Clientes</div>${DB.clientes.map(c=>`
     <div class="card"><div class="row" style="border:none">
@@ -1191,9 +1079,8 @@ function tryLogin(){
 /* ============================== BIND VIEW ============================== */
 function bindView(){
   hookCreatorTaps();
-  if(S.view==='form' && S.sub==='mayoreo'){ _mayLast='tr'; App.mayoreoPrecio(); App.mayoreoEstado(); }
-  if(S.view==='form' && S.sub==='libre'){ _mayLast='tr'; App.libreMonto(); App.mayoreoEstado(); }
-  if(S.view==='form' && S.sub==='combo') App.comboInfo();
+  if(S.view==='form' && S.sub==='mayoreo'){ App.mayoreoPrecio(); }
+  if(S.view==='form' && S.sub==='libre'){ App.libreMonto(); }
   if(S.view==='form' && S.sub==='merma') App.mermaInfo();
   if(S.view==='cierre'){ _lastPago='tr'; cierreRecalc(); }
 }
@@ -1202,21 +1089,9 @@ function bindView(){
 const App = {
   go(v){ S.view=v; S.sub=null; S.ctx={}; render(); window.scrollTo(0,0); },
   sub(s){ S.sub=s; render(); window.scrollTo(0,0); },
-  async form(t){ if(['mayoreo','combo','merma'].includes(t) && !DB.jornada){ DB.jornada={id:uid(),fecha:today(),trabajadorId:S.user.id,estado:'abierta',entregas:{},mayoreo:[],combos:[],mermas:[],gastos:[],libres:[],devoluciones:[],cierre:null}; await persist(); } S.view='form'; S.sub=t; render(); window.scrollTo(0,0); },
+  async form(t){ if(['mayoreo','merma'].includes(t) && !DB.jornada){ DB.jornada=nuevaJornada(); await persist(); } S.view='form'; S.sub=t; render(); window.scrollTo(0,0); },
   logout(){ S.user=null; render(); },
   verHistorialTab(){ S.view='ajustes'; S.sub='hist'; render(); },
-
-  async abrirDia(){
-    const entregas={}; let algo=false;
-    DB.productos.filter(p=>p.activo).forEach(p=>{const v=parseInt(document.getElementById('ent_'+p.id).value)||0; if(v>0){entregas[p.id]=v;algo=true;}});
-    if(!algo){ toast('Ingresa al menos una cantidad'); return; }
-    // Consumo de insumos: se descuenta al producir (entrega de la mañana), no venta por venta
-    Object.entries(entregas).forEach(([pid,qty])=>{
-      const p=prod(pid); if(p.receta&&p.receta.length){ p.receta.forEach(r=>{ const ins=insumo(r.insumoId); if(ins.id) ins.stock=Math.round((ins.stock-r.cantidad*qty)*1000)/1000; }); }
-    });
-    DB.jornada={id:uid(),fecha:today(),trabajadorId:S.user.id,estado:'abierta',entregas,mayoreo:[],combos:[],mermas:[],gastos:[],libres:[],devoluciones:[],cierre:null};
-    await persist(); App.go('inicio'); toast('Día abierto');
-  },
 
   mayoreoPrecio(){
     const pid=document.getElementById('f_prod'); if(!pid) return;
@@ -1224,9 +1099,21 @@ const App = {
     if(pr && !pr.dataset.touched) pr.value=p.mayoreo;
     const qty=parseInt(document.getElementById('f_qty').value)||0;
     const precio=parseInt(pr.value)||0;
-    const t=document.getElementById('f_tot'); if(t) t.textContent=`Total: ${$(qty*precio)} · (menudeo sería ${$(qty*p.menudeo)})`;
-    const d=document.getElementById('f_disp'); if(d){ const disp=disponible(pid.value); d.textContent=`Disponible hoy: ${disp} und`; d.style.color=disp<qty?'var(--coral)':'var(--ink-soft)'; }
-    _mayTotal=qty*precio; mayoreoRebalance();
+    const t=document.getElementById('f_tot'); if(t) t.textContent=`Total: ${$(qty*precio)}`;
+    App.mayoreoSaldo();
+  },
+  mayoreoSaldo(){
+    const qty=parseInt((document.getElementById('f_qty')||{}).value)||0;
+    const precio=parseInt((document.getElementById('f_precio')||{}).value)||0;
+    const total=qty*precio;
+    const ef=parseInt((document.getElementById('f_efec')||{}).value)||0;
+    const tr=parseInt((document.getElementById('f_transf')||{}).value)||0;
+    const saldo=Math.max(0,total-ef-tr);
+    const el=document.getElementById('f_saldo'); if(!el) return;
+    if(total<=0){ el.textContent=''; return; }
+    if(saldo<=0) el.innerHTML='<b style="color:var(--verde)">✓ Pagado completo</b>';
+    else if(ef+tr<=0) el.innerHTML='<b style="color:var(--coral)">Queda TODO fiado: '+$(saldo)+'</b>';
+    else el.innerHTML='<b style="color:var(--mango-text)">Abona '+$(ef+tr)+' · queda debiendo '+$(saldo)+'</b> (fiado)';
   },
   async saveMayoreo(){
     const clienteId=document.getElementById('f_cli').value;
@@ -1234,38 +1121,23 @@ const App = {
     const qty=parseInt(document.getElementById('f_qty').value)||0;
     const precio=parseInt(document.getElementById('f_precio').value)||0;
     if(qty<1||precio<1){ toast('Revisa cantidad y precio'); return; }
-    if(qty>disponible(prodId)){ toast(`Solo quedan ${disponible(prodId)} de ${prod(prodId).nombre}`); return; }
-    const _est=document.getElementById('f_estado').value;
-    const _total=qty*precio; let _ef=0,_tr=0;
-    if(_est==='pagado'){ _ef=parseInt(document.getElementById('f_efec').value)||0; _ef=Math.min(_ef,_total); _tr=Math.max(0,_total-_ef); }
-    DB.jornada.mayoreo.push({id:uid(),clienteId,prodId,qty,precio,
-      estado:_est, efectivo:_ef, transferencia:_tr, verificada:false,
+    const total=qty*precio;
+    let ef=Math.min(parseInt(document.getElementById('f_efec').value)||0,total);
+    let tr=Math.min(parseInt(document.getElementById('f_transf').value)||0,Math.max(0,total-ef));
+    const saldo=Math.max(0,total-ef-tr);
+    if(saldo>0 && !clienteId){ toast('Si queda debiendo, elige un cliente'); return; }
+    const id=uid();
+    DB.jornada.mayoreo.push({id,clienteId,prodId,qty,precio,
+      estado:saldo>0?'fiado':'pagado', efectivo:ef, transferencia:tr, saldo, verificada:false,
       referencia:(document.getElementById('f_ref').value||'').trim()});
-    await persist(); App.go('registrar'); toast('Venta guardada');
-  },
-
-  comboInfo(){
-    const sel=document.getElementById('f_combo'); if(!sel) return;
-    const c=combo(sel.value); const q=parseInt(document.getElementById('f_qty').value)||0;
-    const el=document.getElementById('f_cinfo');
-    const need=(c.gatillo+c.bono)*q; const disp=disponible(c.prodId);
-    if(el) el.innerHTML=`Salen <b>${need}</b> ${prod(c.prodId).nombre.toLowerCase()}(s): el cliente paga <b>${c.gatillo*q}</b> y se regalan <b style="color:var(--aji)">${c.bono*q}</b>.<br><span style="color:${disp<need?'var(--coral)':'var(--ink-soft)'}">Disponible hoy: ${disp} und</span>`;
-  },
-  async saveCombo(){
-    const comboId=document.getElementById('f_combo').value;
-    const qty=parseInt(document.getElementById('f_qty').value)||0;
-    if(qty<1){ toast('¿Cuántos combos?'); return; }
-    const _cb=combo(comboId), _need=(_cb.gatillo+_cb.bono)*qty;
-    if(_need>disponible(_cb.prodId)){ toast(`Solo quedan ${disponible(_cb.prodId)} de ${prod(_cb.prodId).nombre}`); return; }
-    DB.jornada.combos.push({id:uid(),comboId,qty});
-    await persist(); App.go('registrar'); toast('Combo guardado');
+    if(saldo>0) DB.fiados.push({id:uid(),origen:id,clienteId,jornadaId:DB.jornada.id,fecha:DB.jornada.fecha,detalle:`${qty} × ${prod(prodId).nombre}`,monto:saldo,estado:'abierto',abonos:[]});
+    await persist(); App.go('registrar'); toast(saldo>0?'Venta guardada — queda fiado':'Venta guardada');
   },
 
   async saveMerma(){
     const prodId=document.getElementById('f_prod').value;
     const qty=parseInt(document.getElementById('f_qty').value)||0;
     if(qty<1){ toast('Cantidad inválida'); return; }
-    if(qty>disponible(prodId)){ toast(`Solo quedan ${disponible(prodId)} de ${prod(prodId).nombre}`); return; }
     const conf=document.getElementById('f_conf'); 
     DB.jornada.mermas.push({id:uid(),prodId,qty,confirmada:conf?conf.checked:false});
     await persist(); App.go('registrar'); toast('Merma registrada');
@@ -1287,26 +1159,11 @@ const App = {
   },
 
   async calcularCierre(archivar){
-    const j=DB.jornada; const quedante={};
-    Object.keys(j.entregas).forEach(id=>{ if(j.entregas[id]>0) quedante[id]=parseInt(document.getElementById('q_'+id).value)||0; });
-    const efectivo=parseInt(document.getElementById('q_efectivo').value)||0;
-    const transfer=parseInt(document.getElementById('q_transfer').value)||0;
-    const pend=(j.mayoreo.filter(m=>m.estado==='fiado').length+(j.libres||[]).filter(v=>v.estado==='fiado').length);
-    // Snapshot del cierre (para el informe) — no genera fiados aún si sigue abierto
-    const {tot}=calcular(j,quedante);
-    j.cierre={quedante,efectivoEsperado:tot.efectivoEsperado,efectivoEntregado:efectivo+transfer,efectivo,transfer,
-      diferencia:(efectivo+transfer)-tot.efectivoEsperado,gananciaNeta:tot.gananciaNeta,ts:Date.now(),pendiente:!archivar&&pend>0};
-    if(archivar || pend===0){
-      // Archivar de verdad: consolidar fiados y mandar al historial
-      j.cierre=null; archivarJornada(j,quedante,efectivo+transfer); j.cierre.efectivo=efectivo; j.cierre.transfer=transfer;
-      DB.historial.push(j); DB.jornada=null;
-      await persist(); S.ctx={jornada:j,from:'cierre'}; S.view='informe'; render(); window.scrollTo(0,0);
-      toast('Día archivado');
-    } else {
-      // Guardar pendiente: el día sigue siendo el activo, se puede seguir cobrando
-      await persist(); S.view='inicio'; render(); window.scrollTo(0,0);
-      toast('Día guardado — queda abierto para los pagos pendientes');
-    }
+    const j=DB.jornada; if(!j) return;
+    archivarJornada(j);
+    DB.historial.push(j); DB.jornada=null;
+    await persist(); S.ctx={jornada:j,from:'cierre'}; S.view='informe'; render(); window.scrollTo(0,0);
+    toast('Día archivado');
   },
   // Reabrir un día archivado para corregirlo (solo admin) — su caso: ayer fió, hoy le pagaron
   async editarDiaPasado(id){
@@ -1314,8 +1171,6 @@ const App = {
     if(DB.jornada && DB.jornada.fecha!==today()){ toast('Cierra o archiva el día en curso primero'); return; }
     if(DB.jornada && DB.jornada.fecha===today()){ toast('Termina el día de hoy antes de editar uno pasado'); return; }
     const j=DB.historial[idx];
-    // Quitar los fiados que generó ese día (se regeneran al re-archivar)
-    DB.fiados=DB.fiados.filter(f=>f.jornadaId!==j.id);
     j.estado='abierta'; j.cierre=null;
     DB.historial.splice(idx,1); DB.jornada=j;
     S.ctx={}; await persist(); App.go('registrar');
@@ -1338,7 +1193,6 @@ const App = {
 
   /* ---- Config CRUD (admin) ---- */
   editProd(id){ if(!esAdmin()){toast('Solo el administrador');return;} S.ctx={editId:id||null}; S.view='form'; S.sub='prodedit'; render(); window.scrollTo(0,0); },
-  editCombo(id){ if(!esAdmin()){toast('Solo el administrador');return;} S.ctx={editId:id||null}; S.view='form'; S.sub='comboedit'; render(); window.scrollTo(0,0); },
   editCli(id){ if(!esAdmin()){toast('Solo el administrador');return;} S.ctx={editId:id||null}; S.view='form'; S.sub='cliedit'; render(); window.scrollTo(0,0); },
   async addEmp(){
     const nombre=prompt('Nombre del trabajador:'); if(!nombre)return;
@@ -1387,15 +1241,28 @@ const App = {
   async desbloquear(){ DB.licencia.activo=true; DB.licencia.maxDate=today(); await persist(); toast('App reactivada'); render(); },
   recalcCierre(){ cierreRecalc(); },
   splitPago(w){ cierreSplit(w,true); },
-  mermaInfo(){ const sel=document.getElementById('f_prod'); if(!sel) return; const d=document.getElementById('f_disp'); if(!d) return; const disp=disponible(sel.value); d.textContent=`Disponible hoy: ${disp} und`; d.style.color='var(--ink-soft)'; },
+  mermaInfo(){},
   mayoreoSplit(w){ _mayLast=w; mayoreoRebalance(); },
   mayoreoEstado(){ const box=document.getElementById('f_pagobox'); if(box) box.style.display=document.getElementById('f_estado').value==='fiado'?'none':''; },
   libreMonto(){
     const m=document.getElementById('l_monto'); if(!m) return;
     const valor=parseInt(m.value)||0;
     const desc=Math.min(parseInt((document.getElementById('l_desc')||{}).value)||0, valor);
-    _mayTotal=valor-desc; mayoreoRebalance();
-    const t=document.getElementById('l_tot'); if(t) t.textContent=desc>0?('Total a cobrar: '+$(_mayTotal)):'';
+    const t=document.getElementById('l_tot'); if(t) t.textContent=desc>0?('Total a cobrar: '+$(valor-desc)):'';
+    App.libreSaldo();
+  },
+  libreSaldo(){
+    const valor=parseInt((document.getElementById('l_monto')||{}).value)||0;
+    const desc=Math.min(parseInt((document.getElementById('l_desc')||{}).value)||0,valor);
+    const total=valor-desc;
+    const ef=parseInt((document.getElementById('f_efec')||{}).value)||0;
+    const tr=parseInt((document.getElementById('f_transf')||{}).value)||0;
+    const saldo=Math.max(0,total-ef-tr);
+    const el=document.getElementById('f_saldo'); if(!el) return;
+    if(total<=0){ el.textContent=''; return; }
+    if(saldo<=0) el.innerHTML='<b style="color:var(--verde)">✓ Pagado completo</b>';
+    else if(ef+tr<=0) el.innerHTML='<b style="color:var(--coral)">Queda TODO fiado: '+$(saldo)+'</b>';
+    else el.innerHTML='<b style="color:var(--mango-text)">Abona '+$(ef+tr)+' · queda debiendo '+$(saldo)+'</b> (fiado)';
   },
   async libreNuevoCliente(){
     S.ctx.libreTmp={monto:(document.getElementById('l_monto')||{}).value||'',concepto:(document.getElementById('l_conc')||{}).value||'',estado:(document.getElementById('f_estado')||{}).value||'pagado',clienteId:''};
@@ -1411,17 +1278,19 @@ const App = {
     const monto=_valor-_desc;
     if(monto<1){ toast('Escribe el valor de la venta'); return; }
     const clienteId=document.getElementById('l_cli').value||'';
-    const estado=document.getElementById('f_estado').value;
-    if(estado==='fiado'&&!clienteId){ toast('El fiado necesita un cliente con nombre'); return; }
-    let ef=0,tr=0;
-    if(estado==='pagado'){ ef=Math.min(parseInt(document.getElementById('f_efec').value)||0,monto); tr=Math.max(0,monto-ef); }
+    let ef=Math.min(parseInt(document.getElementById('f_efec').value)||0,monto);
+    let tr=Math.min(parseInt(document.getElementById('f_transf').value)||0,Math.max(0,monto-ef));
+    const saldo=Math.max(0,monto-ef-tr);
+    if(saldo>0 && !clienteId){ toast('Si queda debiendo, elige un cliente'); return; }
     const concepto=(document.getElementById('l_conc').value||'').trim();
     const referencia=(document.getElementById('f_ref').value||'').trim();
-    if(!DB.jornada){ DB.jornada={id:uid(),fecha:today(),trabajadorId:S.user.id,estado:'abierta',entregas:{},mayoreo:[],combos:[],mermas:[],gastos:[],libres:[],devoluciones:[],cierre:null}; }
+    if(!DB.jornada){ DB.jornada=nuevaJornada(); }
     DB.jornada.libres=DB.jornada.libres||[];
-    DB.jornada.libres.push({id:uid(),clienteId,monto,descuento:_desc,efectivo:ef,transferencia:tr,estado,concepto,referencia,verificada:false,ts:Date.now()});
+    const id=uid();
+    DB.jornada.libres.push({id,clienteId,monto,descuento:_desc,efectivo:ef,transferencia:tr,saldo,estado:saldo>0?'fiado':'pagado',concepto,referencia,verificada:false,ts:Date.now()});
+    if(saldo>0) DB.fiados.push({id:uid(),origen:id,clienteId,jornadaId:DB.jornada.id,fecha:DB.jornada.fecha,detalle:concepto||'Venta libre',monto:saldo,estado:'abierto',abonos:[]});
     S.ctx={};
-    await persist(); App.go('registrar'); toast('Venta registrada');
+    await persist(); App.go('registrar'); toast(saldo>0?'Venta registrada — queda fiado':'Venta registrada');
   },
   compartirRecibo(tipo,id){
     const j=DB.jornada||S.ctx.jornada; if(!j) return;
@@ -1459,21 +1328,8 @@ const App = {
     App.form('libre'); toast('Cotización lista — ciérrala como venta');
   },
   async delCoti(id){ if(!confirm('¿Quitar esta cotización?')) return; DB.cotizaciones=DB.cotizaciones.filter(x=>x.id!==id); await persist(); render(); },
-  abrirMetodoAntiguo(){
-    const c=prompt('Clave del método de entrega:'); if(c===null) return;
-    if(c!==DB.pinMetodo){ toast('Clave incorrecta'); return; }
-    App.go('abrir');
-  },
-  async cambiarPinMetodo(){
-    const admin=DB.usuarios.find(u=>u.rol==='admin');
-    const actual=prompt('Tu clave de administrador:'); if(actual===null) return;
-    if(actual!==admin.pin){ toast('Clave de admin incorrecta'); return; }
-    const nueva=prompt('Nueva clave para el método de entrega (4 dígitos):')||'';
-    if(!/^\d{4}$/.test(nueva)){ toast('Debe ser de 4 dígitos'); return; }
-    DB.pinMetodo=nueva; await persist(); toast('Clave del método actualizada');
-  },
   async nuevoGasto(){
-    if(!DB.jornada){ DB.jornada={id:uid(),fecha:today(),trabajadorId:S.user.id,estado:'abierta',entregas:{},mayoreo:[],combos:[],mermas:[],gastos:[],libres:[],devoluciones:[],cierre:null}; await persist(); }
+    if(!DB.jornada){ DB.jornada=nuevaJornada(); await persist(); }
     App.form('gasto');
   },
   async saveNegocio(){
@@ -1491,10 +1347,6 @@ const App = {
     if(!/^\d{4}$/.test(nueva)){ toast('La clave debe ser de 4 dígitos'); return; }
     if(DB.usuarios.some(u=>u.id!==admin.id&&u.pin===nueva)){ toast('Ese PIN ya está en uso'); return; }
     admin.pin=nueva; await persist(); toast('Clave actualizada');
-  },
-  async abrirSinEntrega(){
-    DB.jornada={id:uid(),fecha:today(),trabajadorId:S.user.id,estado:'abierta',entregas:{},mayoreo:[],combos:[],mermas:[],gastos:[],libres:[],devoluciones:[],cierre:null};
-    await persist(); App.go('registrar'); toast('D\u00eda abierto en modo venta libre');
   },
   async nuevoClienteRapido(){
     const nombre=prompt('Nombre del nuevo cliente:'); if(!nombre) return;
@@ -1560,7 +1412,7 @@ const App = {
     if(!confirm('¿Quitar este registro del día?')) return;
     if(tipo==='libre') j.libres=(j.libres||[]).filter(x=>x.id!==id);
     if(tipo==='mayoreo') j.mayoreo=j.mayoreo.filter(x=>x.id!==id);
-    if(tipo==='combo') j.combos=j.combos.filter(x=>x.id!==id);
+    if(tipo==='libre'||tipo==='mayoreo') DB.fiados=DB.fiados.filter(f=>f.origen!==id);
     if(tipo==='merma') j.mermas=j.mermas.filter(x=>x.id!==id);
     if(tipo==='gasto') j.gastos=j.gastos.filter(x=>x.id!==id);
     if(tipo==='devolucion') j.devoluciones=(j.devoluciones||[]).filter(x=>x.id!==id);
@@ -1573,7 +1425,7 @@ const App = {
   },
   compartirInforme(){
     const j=S.ctx.jornada; if(!j) return;
-    const {tot}=calcular(j,j.cierre.quedante);
+    const {tot}=calcular(j);
     const dif=j.cierre.diferencia; const fiadoDia=tot.ingMayoreoFiado+(tot.ingLibresFiado||0);
     const txt=`LAS ANTIOQUEÑAS — Informe del ${fmtFecha(j.fecha)}\n`+
       `Ventas totales: ${$(tot.ventasTotales)}\n`+
@@ -1628,18 +1480,6 @@ const App = {
     await persist(); App.volverAjustes('cli'); toast('Cliente guardado');
   },
   async delCli(id){ if(!confirm('¿Eliminar este cliente?')) return; DB.clientes=DB.clientes.filter(c=>c.id!==id); await persist(); App.volverAjustes('cli'); toast('Cliente eliminado'); },
-  async saveComboCfg(){
-    const id=S.ctx.editId;
-    const prodId=document.getElementById('cb_prod').value;
-    const gatillo=parseInt(document.getElementById('cb_gat').value)||0;
-    const bono=parseInt(document.getElementById('cb_bon').value)||0;
-    if(gatillo<1){ toast('¿Cuántas paga el cliente?'); return; }
-    const nombre=`${prod(prodId).nombre} ${gatillo}+${bono}`;
-    if(id) Object.assign(combo(id),{nombre,prodId,gatillo,bono});
-    else DB.combos.push({id:uid(),nombre,prodId,gatillo,bono,activo:true});
-    await persist(); App.volverAjustes('combo'); toast('Combo guardado');
-  },
-  async delCombo(id){ if(!confirm('¿Eliminar este combo?')) return; DB.combos=DB.combos.filter(c=>c.id!==id); await persist(); App.volverAjustes('combo'); toast('Combo eliminado'); },
   volverAjustes(sub){ S.view='ajustes'; S.sub=sub||null; S.ctx={}; render(); window.scrollTo(0,0); },
 };
 window.App=App;
@@ -1648,20 +1488,11 @@ window.App=App;
 document.addEventListener('input',e=>{ if(e.target.id==='f_precio') e.target.dataset.touched='1'; });
 
 /* Cierra y consolida una jornada (usado por el cierre manual y por el auto-archivo). */
-function archivarJornada(j,quedante,efectivoEntregado){
-  const {tot}=calcular(j,quedante);
-  const efec = efectivoEntregado!=null?efectivoEntregado:Math.round(tot.efectivoEsperado);
-  j.cierre={quedante,efectivoEsperado:tot.efectivoEsperado,efectivoEntregado:efec,efectivo:efec,transfer:0,
-    diferencia:efec-tot.efectivoEsperado,gananciaNeta:tot.gananciaNeta,ts:Date.now()};
+function archivarJornada(j){
+  const {tot}=calcular(j);
+  j.cierre={efectivoEsperado:tot.efectivoEsperado, efectivoEntregado:tot.efectivoEsperado,
+    diferencia:0, gananciaNeta:tot.gananciaNeta, ventasTotales:tot.ventasTotales, ts:Date.now(), sinCuadre:true};
   j.estado='cerrada';
-  j.mayoreo.filter(m=>m.estado==='fiado').forEach(m=>{
-    if(!DB.fiados.some(f=>f.jornadaId===j.id&&f.origen===m.id))
-      DB.fiados.push({id:uid(),origen:m.id,clienteId:m.clienteId,jornadaId:j.id,fecha:j.fecha,detalle:`${m.qty} × ${prod(m.prodId).nombre}`,monto:m.qty*m.precio,estado:'abierto',abonos:[]});
-  });
-  (j.libres||[]).filter(v=>v.estado==='fiado').forEach(v=>{
-    if(!DB.fiados.some(f=>f.jornadaId===j.id&&f.origen===v.id))
-      DB.fiados.push({id:uid(),origen:v.id,clienteId:v.clienteId,jornadaId:j.id,fecha:j.fecha,detalle:v.concepto||'Venta libre',monto:v.monto,estado:'abierto',abonos:[]});
-  });
 }
 
 /* ========================= LICENCIA / KILL-SWITCH ========================= */
@@ -1764,16 +1595,15 @@ function bindCreator(){}
 // Si quedó un día abierto de fecha anterior, se cierra y archiva solo. Devuelve true si archivó.
 function autoArchivar(){
   if(DB.jornada && DB.jornada.fecha!==today()){
-    const j=DB.jornada; const quedante={};
-    Object.keys(j.entregas||{}).forEach(id=>{ if(j.entregas[id]>0) quedante[id]=0; });
-    if(!j.cierre) archivarJornada(j,quedante,null);
+    const j=DB.jornada;
+    if(!j.cierre) archivarJornada(j);
     DB.historial.push(j); DB.jornada=null; return true;
   }
   return false;
 }
 function sanea(){
-  DB.fiados=DB.fiados||[]; DB.historial=DB.historial||[]; DB.combos=DB.combos||[];
-  DB.insumos=DB.insumos||[]; DB.proveedores=DB.proveedores||[]; DB.compras=DB.compras||[]; DB.cotizaciones=DB.cotizaciones||[]; DB.negocio=DB.negocio||{nombre:'LAS ANTIOQUEÑAS',sub:'Fritos y bebidas',tel:'',nit:''}; DB.pinMetodo=DB.pinMetodo||'2580';
+  DB.fiados=DB.fiados||[]; DB.historial=DB.historial||[];
+  DB.insumos=DB.insumos||[]; DB.proveedores=DB.proveedores||[]; DB.compras=DB.compras||[]; DB.cotizaciones=DB.cotizaciones||[]; DB.negocio=DB.negocio||{nombre:'LAS ANTIOQUEÑAS',sub:'Fritos y bebidas',tel:'',nit:''};
   DB.compras.forEach(c=>{ if(!c.tipo) c.tipo='insumo'; });
   if(DB.jornada && !DB.jornada.libres) DB.jornada.libres=[];
   if(DB.jornada && !DB.jornada.devoluciones) DB.jornada.devoluciones=[];
