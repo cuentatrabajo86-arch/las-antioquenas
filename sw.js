@@ -8,14 +8,18 @@
    clientes seguirán viendo la app vieja.
    =========================================================== */
 
-const VERSION = 'nexbit-v1';
+const VERSION = 'nexbit-v2';
 const SHELL   = VERSION + '-shell';   // la app
 const EXTERNO = VERSION + '-externo'; // fuentes y librerías
 
 /* Lo mínimo para que la app abra sin señal */
 const ARCHIVOS = [
   './',
-  './index.html'
+  './index.html',
+  './manifest.json',
+  './icon-192.png',
+  './icon-512.png',
+  './icon-maskable-512.png'
 ];
 
 /* Librerías de terceros: se guardan al vuelo la primera vez con internet */
