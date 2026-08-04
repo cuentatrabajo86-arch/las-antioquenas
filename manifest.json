@@ -1,16 +1,20 @@
 {
-  "name": "Nexbit — Punto de venta",
-  "short_name": "Nexbit",
-  "description": "Ventas, fiados y contabilidad para tu negocio.",
+  "name": "HDJ — Jesús Daniel Hernández",
+  "short_name": "HDJ",
+  "description": "Ventas, fiados y contabilidad del negocio.",
   "start_url": "./index.html",
   "scope": "./",
   "id": "./index.html",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#FDF9F0",
-  "theme_color": "#171310",
+  "background_color": "#0C0E11",
+  "theme_color": "#0C0E11",
   "lang": "es-CO",
-  "categories": ["business", "finance", "productivity"],
+  "categories": [
+    "business",
+    "finance",
+    "productivity"
+  ],
   "icons": [
     {
       "src": "icon-192.png",
