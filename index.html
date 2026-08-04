@@ -666,7 +666,7 @@ function navbar(){
   return `<aside class="drawer" id="drawer">
     <div class="dhead">
       <img src="${logoActual()}" alt="" id="brandtap">
-      <div class="dtx"><b>${N.nombre||'NEXBIT'}</b><small>${N.sub||'Punto de venta y contabilidad'}</small></div>
+      <div class="dtx"><b>${N.nombre||'NEXBIT'}</b><small>${N.sub||'Punto de venta'} &middot; ${APP_VER}</small></div>
     </div>
     <nav class="dnav">
       <div class="dgrp">Operaciones</div>
@@ -1428,7 +1428,7 @@ function panelNegocio(){
     <div class="card"><h3>Logo del negocio</h3>
       <div style="display:flex;align-items:center;gap:14px;margin-bottom:14px">
         <img src="${logoActual()}" alt="" style="width:66px;height:66px;border-radius:50%;object-fit:cover;border:1px solid var(--line);background:#fff;flex:0 0 auto">
-        <div class="hint" style="margin:0;flex:1">Aparece en la entrada, en el menú y en la factura que le mandas al cliente.</div>
+        <div class="hint" style="margin:0;flex:1">Aparece en la entrada, en el menú y en la factura. El que subas aquí manda sobre el que trae la app.</div>
       </div>
       <input type="file" accept="image/*" id="n_logo" style="display:none" onchange="App.subirLogo(event)">
       <button class="btn btn-line" onclick="document.getElementById('n_logo').click()">Subir mi logo</button>
@@ -1565,7 +1565,7 @@ function loginView(){
         <button class="authbtn" id="lg_btn">Entrar</button>
       </div>
     </div>
-    <div class="loginhint">Nexbit</div>
+    <div class="loginhint">Nexbit · ${APP_VER}</div>
   </div>`;
 }
 function bindLogin(){
@@ -2328,6 +2328,7 @@ document.addEventListener('input',e=>{ if(e.target.id==='f_precio') e.target.dat
    3) Anti-retroceso de reloj: DB.licencia.maxDate.
    Acceso al panel oculto: toca el logo (login/bloqueo) o la marca de arriba
    5 veces y entra con el PIN de creador (DB.creatorPin, por defecto 2468). */
+const APP_VER = 'v11';
 const GRACIA_DIAS = 7;
 /* Cuenta de soporte del creador. No vive en DB.usuarios: el cliente no la ve,
    no la puede editar ni borrar, y sobrevive aunque cambie todas las claves.
@@ -2400,7 +2401,7 @@ function lockView(){
       <label class="fld"><span>Contraseña</span><input type="password" id="lk_pass" placeholder="••••••••"></label>
       <button class="btn btn-dark" onclick="App.loginSoporte()">Entrar como soporte</button>
     </div>
-    <div class="loginhint">Nexbit</div>
+    <div class="loginhint">Nexbit · ${APP_VER}</div>
   </div>`;
 }
 function bindLock(){ hookCreatorTaps(); }
