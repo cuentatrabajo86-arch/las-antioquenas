@@ -364,11 +364,12 @@ const Store = {
     return localLoad();
   },
   async save(db){
-    if(USE_FIRESTORE && _docRef){ try{ await _docRef.set({db, updatedAt:Date.now()}); return; }catch(e){} }
+    _revLocal++;
+    if(USE_FIRESTORE && _docRef){ try{ await _docRef.set({db, rev:_revLocal, updatedAt:Date.now()}); return; }catch(e){} }
     return localSave(db);
   },
   subscribe(cb){
-    if(USE_FIRESTORE && _docRef){ _docRef.onSnapshot(d=>{ if(d.exists && !d.metadata.hasPendingWrites && d.data().db) cb(d.data().db); }); }
+    if(USE_FIRESTORE && _docRef){ _docRef.onSnapshot(d=>{ if(d.exists && !d.metadata.hasPendingWrites && d.data().db) cb(d.data().db, d.data().rev||0); }); }
   }
 };
 
@@ -382,7 +383,7 @@ const today = () => new Date().toISOString().slice(0,10);
 const fmtFecha = d => new Date(d+'T12:00:00').toLocaleDateString('es-CO',{weekday:'short',day:'numeric',month:'short'});
 const COP = new Intl.NumberFormat('es-CO',{style:'currency',currency:'COP',maximumFractionDigits:0});
 const $ = money => COP.format(Math.round(money||0));
-const prod = id => DB.productos.find(p=>p.id===id)||{};
+const prod = id => DB.productos.find(p=>p.id===id)||{nombre:'(producto borrado)',costo:0,menudeo:0,mayoreo:0,umbral:1};
 const cliente = id => DB.clientes.find(c=>c.id===id)||{nombre:'—'};
 const insumo = id => DB.insumos.find(i=>i.id===id)||{nombre:'—',unidad:'',stock:0,umbral:0,costo:0};
 const proveedor = id => DB.proveedores.find(v=>v.id===id)||{nombre:'—'};
@@ -539,6 +540,7 @@ function seed(){
     cotizaciones:[],      // {id,clienteId,concepto,valor,fecha,ts}
     negocio:{nombre:'NEXBIT',sub:'Punto de venta y contabilidad',tel:'',nit:'',configurado:false,usaInsumos:true,email:'',direccion:''},
     deudas:[],
+    papelera:[],
     licencia:{activo:true,vence:null,url:'',lastCheck:0,maxDate:''},
     creatorPin:'2468',
   };
@@ -1181,6 +1183,7 @@ function vInforme(){
 function generarFactura(o){
   const N=DB.negocio||{};
   const esCoti=/COTIZ/i.test(o.titulo||'');
+  const esAbono=/ABONO/i.test(o.titulo||'');
   const W=760, pad=46;
   const lineas=o.lineas||[];
   const H = 470 + lineas.length*52 + (o.pago?52:0) + (o.ref?42:0)
@@ -1202,14 +1205,14 @@ function generarFactura(o){
   y+=6; guion(y); y+=38;
   if(N.sub){ cen(String(N.sub).toUpperCase(), y, '400 22px Arial','#3A3A3A'); y+=36; guion(y); y+=38; }
   cen(fmtFecha(o.fecha)+(fmtHora(o.ts)?'   '+fmtHora(o.ts):''), y, '400 23px Arial','#3A3A3A'); y+=34;
-  cen((esCoti?'COTIZACIÓN  ':'FACTURA DE VENTA  ')+(o.folio||''), y, '700 24px Arial'); y+=18;
+  cen((esCoti?'COTIZACIÓN  ':esAbono?'RECIBO DE ABONO  ':'FACTURA DE VENTA  ')+(o.folio||''), y, '700 24px Arial'); y+=18;
   guion(y); y+=46;
 
   lineas.forEach(l=>{ izq(l[0], y, '400 25px Arial'); if(l[1]) der(l[1], y, '400 25px Arial'); y+=52; });
 
   y+=4; guion(y); y+=44;
   izq('Subtotal:', y, '400 25px Arial','#3A3A3A'); der($(o.total), y, '400 25px Arial','#3A3A3A'); y+=48;
-  izq(esCoti?'Total cotizado:':'Total venta:', y, '700 31px Arial'); der($(o.total), y, '700 31px Arial'); y+=46;
+  izq(esCoti?'Total cotizado:':esAbono?'Abonó:':'Total venta:', y, '700 31px Arial'); der($(o.total), y, '700 31px Arial'); y+=46;
   if(o.pago){ izq('Tipo de pago:', y, '400 24px Arial','#3A3A3A');
     der(String(o.pago).toUpperCase(), y, '600 24px Arial', o.fiado?'#C0392B':'#177A4C'); y+=52; }
   if(o.ref){ izq('Ref. transferencia: '+o.ref, y, '400 21px Arial','#6A6A6A'); y+=42; }
@@ -1267,29 +1270,63 @@ function drawChart(ranking){
 function vCobros(){
   const abiertos=DB.fiados.filter(f=>f.estado!=='pagado');
   const total=abiertos.reduce((s,f)=>s+saldoFiado(f),0);
-  // agrupar por cliente
   const porCli={};
   abiertos.forEach(f=>{ (porCli[f.clienteId]=porCli[f.clienteId]||[]).push(f); });
-  const bloques=Object.entries(porCli).map(([cid,arr])=>{
-    const saldo=arr.reduce((s,f)=>s+saldoFiado(f),0);
-    const masVieja=Math.min(...arr.map(f=>diasDesde(f.fecha)));
-    const sem=masVieja>=15?'bad':masVieja>=7?'warn':'ok';
-    return `<div class="card"><div class="row" style="border:none;padding-bottom:6px">
-        <div style="display:flex;align-items:center;gap:9px"><span class="sem ${sem}"></span><div><div class="lab">${cliente(cid).nombre}</div><div class="sub">${arr.length} deuda(s) · más vieja hace ${masVieja} día(s)</div></div></div>
-        <div class="val">${$(saldo)}</div></div>
-      ${arr.map(f=>`<div class="row"><div><div class="sub">${fmtFecha(f.fecha)} · ${f.detalle}</div></div>
-        <div style="display:flex;gap:8px;align-items:center"><span class="val">${$(saldoFiado(f))}</span>
-        <button class="btn btn-sm btn-ghost" onclick="App.abonar('${f.id}')">Abonar</button></div></div>`).join('')}
-    </div>`;
-  }).join('');
+  const ua=S.ctx.ultimoAbono;
+
+  const bloques=Object.entries(porCli)
+    .sort((a,b)=> b[1].reduce((s,f)=>s+saldoFiado(f),0) - a[1].reduce((s,f)=>s+saldoFiado(f),0))
+    .map(([cid,arr])=>{
+      const saldo=arr.reduce((s,f)=>s+saldoFiado(f),0);
+      const original=arr.reduce((s,f)=>s+f.monto,0);
+      const pagado=original-saldo, pct=original?Math.round(pagado*100/original):0;
+      const masVieja=Math.min(...arr.map(f=>diasDesde(f.fecha)));
+      const sem=masVieja>=15?'bad':masVieja>=7?'warn':'ok';
+      const orden=arr.slice().sort((a,b)=> a.fecha===b.fecha ? ((a.ts||0)-(b.ts||0)) : (a.fecha<b.fecha?-1:1));
+      return `<div class="card">
+        <div class="row" style="border:none;padding:0 0 10px">
+          <div style="display:flex;align-items:center;gap:9px;min-width:0">
+            <span class="sem ${sem}"></span>
+            <div style="min-width:0"><div class="lab">${cliente(cid).nombre}</div>
+            <div class="sub">${arr.length} deuda${arr.length===1?'':'s'} · la más vieja hace ${masVieja} día${masVieja===1?'':'s'}</div></div>
+          </div>
+          <div class="val" style="color:var(--coral);font-size:17px">${$(saldo)}</div>
+        </div>
+        ${pagado>0?`<div class="dprog"><i style="width:${pct}%"></i></div>
+        <div class="sub" style="margin-bottom:10px">Ha abonado ${$(pagado)} de ${$(original)} · ${pct}%</div>`:''}
+        <button class="btn btn-verde" onclick="App.abonarCliente('${cid}')">Abonar a la deuda total</button>
+        <div class="hint" style="margin:8px 0 12px">El abono se descuenta empezando por la deuda más vieja.</div>
+        <div class="seclabel" style="margin:0 0 6px">Deudas de este cliente</div>
+        ${orden.map(f=>{
+          const sal=saldoFiado(f), ab=f.monto-sal;
+          return `<div class="row">
+            <div style="min-width:0"><div class="sub">${fmtFecha(f.fecha)} · ${f.detalle||'Venta'}</div>
+            ${ab>0?`<div class="sub" style="color:var(--verde)">abonado ${$(ab)} de ${$(f.monto)}</div>`:''}</div>
+            <div style="display:flex;gap:8px;align-items:center;flex:0 0 auto">
+              <span class="val">${$(sal)}</span>
+              <button class="btn btn-sm btn-ghost" onclick="App.abonar('${f.id}')">Solo esta</button>
+            </div></div>`;}).join('')}
+      </div>`;
+    }).join('');
+
   return `<div class="view-title">Deudas por cobrar</div>
     <div class="view-sub">${abiertos.length? `${$(total)} por cobrar en total`:'Nadie debe. Todo al día.'}</div>
+    ${ua?`<div class="card" style="border-color:var(--verde)">
+      <div class="row" style="border:none;padding:0 0 10px"><div>
+        <div class="lab">Abono de ${cliente(ua.cid).nombre}</div>
+        <div class="sub">${ua.recibo} · cubrió ${ua.aplicado.length} deuda${ua.aplicado.length===1?'':'s'} · le queda debiendo ${$(ua.restante)}</div>
+      </div><div class="val" style="color:var(--verde)">${$(ua.monto)}</div></div>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-verde btn-sm" style="flex:1" onclick="App.reciboAbono()">Enviar recibo</button>
+        <button class="btn btn-ghost btn-sm" style="width:auto" onclick="App.cerrarAviso()">Listo</button>
+      </div></div>`:''}
     ${abiertos.length? `<div class="statgrid">
         <div class="stat neg"><b>${$(total)}</b><span>Total en la calle</span></div>
         <div class="stat"><b>${Object.keys(porCli).length}</b><span>Clientes deben</span></div>
       </div>${bloques}`
       : `<div class="empty">${svg('money')}<div>No hay fiados pendientes.</div></div>`}`;
 }
+
 const diasDesde = f => Math.floor((new Date(today())-new Date(f))/86400000);
 const montoAbono = a => (typeof a==='number') ? a : (a && a.monto) || 0;
 const saldoFiado = f => f.monto - (f.abonos||[]).reduce((s,a)=>s+montoAbono(a),0);
@@ -1389,11 +1426,29 @@ function panelNegocio(){
       <p class="hint" style="margin:0 0 12px">Es el PIN con el que entras como dueño. Cámbialo cuando quieras.</p>
       <button class="btn btn-line" onclick="App.cambiarClave()">Cambiar mi clave de entrada</button>
     </div>
-    <div class="seclabel">Respaldo</div>
-    <div class="card"><h3>Descargar tus datos</h3>
-      <p class="hint" style="margin:0 0 12px">Baja un archivo con todos tus días para abrirlo en Excel.</p>
-      <button class="btn btn-line" onclick="App.exportarCSV()">Descargar CSV</button>
+    <div class="seclabel">Copia de seguridad</div>
+    <div class="card"><h3>Respaldo completo</h3>
+      <p class="hint" style="margin:0 0 12px">Baja un archivo con TODO: ventas, clientes, productos, deudas y fiados. Este sí se puede volver a cargar si algo se pierde. Guárdalo en Drive o mándatelo por WhatsApp.</p>
+      ${(()=>{const u=DB.ultimoRespaldo; if(!u) return '<div class="warnbox" style="margin-bottom:12px">Nunca has hecho un respaldo.</div>';
+        const d=Math.floor((new Date(today())-new Date(u))/86400000);
+        return d>=7?`<div class="warnbox" style="margin-bottom:12px">Tu último respaldo fue hace ${d} días. Hazlo cada semana.</div>`
+                   :`<div class="hint" style="margin:0 0 12px">Último respaldo: ${fmtFecha(u)}.</div>`;})()}
+      <button class="btn btn-primary" onclick="App.bajarRespaldo()">Descargar respaldo</button>
+      <div style="height:10px"></div>
+      <input type="file" accept="application/json,.json" id="n_resp" style="display:none" onchange="App.subirRespaldo(event)">
+      <button class="btn btn-line" onclick="document.getElementById('n_resp').click()">Restaurar desde un respaldo</button>
+      <div style="height:10px"></div>
+      <button class="btn btn-ghost btn-sm" onclick="App.exportarCSV()">Descargar CSV (solo para Excel)</button>
     </div>
+    ${(DB.papelera||[]).length?`<div class="seclabel">Papelera</div>
+    <div class="card"><h3>Registros borrados</h3>
+      <p class="hint" style="margin:0 0 12px">Lo que se borra queda aquí. Los últimos ${(DB.papelera||[]).length}.</p>
+      ${DB.papelera.slice(0,12).map(it=>`<div class="row">
+        <div style="min-width:0"><div class="lab">${it.tipo==='mayoreo'||it.tipo==='libre'?'Venta':it.tipo==='gasto'?'Gasto':it.tipo==='merma'?'Producto dañado':'Devolución'} del ${fmtFecha(it.fecha)}</div>
+        <div class="sub">borrado ${fmtFecha(it.borrado)}${it.usuario?' por '+it.usuario:''}${(it.fiados||[]).length?' · traía fiado':''}</div></div>
+        <button class="btn btn-sm btn-line" style="width:auto" onclick="App.restaurar('${it.id}')">Recuperar</button>
+      </div>`).join('')}
+    </div>`:''}
     <div class="seclabel">Limpieza</div>
     <div class="card"><h3>Dejarla lista para mostrar</h3>
       <p class="hint" style="margin:0 0 12px">Borra <b>todos</b> los movimientos (ventas, gastos, deudas, compras y cotizaciones) y deja intactos tu catálogo, tus clientes, tu logo y tu configuración. Útil para arrancar en limpio o para enseñarle la app a un cliente.</p>
@@ -1582,6 +1637,57 @@ const App = {
     S.ctx={jornada:j,from:'historial'}; S.view='informe'; render(); window.scrollTo(0,0);
   },
 
+  /* Reparte UN abono entre todas las deudas del cliente, empezando por la más vieja.
+     Cada deuda recibe su parte con el mismo n.º de recibo, así queda auditable. */
+  repartirAbono(cid, monto, datos){
+    const abiertas=DB.fiados.filter(f=>f.clienteId===cid && f.estado!=='pagado' && saldoFiado(f)>0)
+      .sort((a,b)=> a.fecha===b.fecha ? ((a.ts||0)-(b.ts||0)) : (a.fecha<b.fecha?-1:1));
+    let resta=monto; const aplicado=[];
+    for(const f of abiertas){
+      if(resta<1) break;
+      const sal=saldoFiado(f), parte=Math.min(resta, sal);
+      f.abonos=f.abonos||[];
+      f.abonos.push(Object.assign({id:uid(),monto:parte},datos));
+      if(saldoFiado(f)<1) f.estado='pagado';
+      aplicado.push({fiadoId:f.id, detalle:f.detalle, fecha:f.fecha, parte, saldaba:sal, quedo:saldoFiado(f)});
+      resta-=parte;
+    }
+    return {aplicado, sobra:resta};
+  },
+  async abonarCliente(cid){
+    const abiertas=DB.fiados.filter(f=>f.clienteId===cid && f.estado!=='pagado');
+    const deuda=abiertas.reduce((t,f)=>t+saldoFiado(f),0);
+    if(deuda<1){ toast('Ese cliente no debe nada'); return; }
+    const v=prompt(`${cliente(cid).nombre} debe ${$(deuda)} en ${abiertas.length} deuda${abiertas.length===1?'':'s'}.\n\n¿Cuánto abona?`);
+    if(v===null) return;
+    const monto=parseInt(v)||0;
+    if(monto<1){ toast('Monto inválido'); return; }
+    if(monto>deuda){ toast('No puede abonar más de lo que debe ('+$(deuda)+')'); return; }
+    const metodo = confirm('¿Fue en EFECTIVO?\n\nAceptar = efectivo · Cancelar = transferencia') ? 'efectivo' : 'transferencia';
+    let referencia='';
+    if(metodo==='transferencia'){ referencia=(prompt('Referencia de la transferencia (opcional)')||'').trim(); }
+    const recibo='A-'+String(DB.consecutivoAbono||1).padStart(4,'0');
+    DB.consecutivoAbono=(DB.consecutivoAbono||1)+1;
+    const datos={metodo,referencia,fecha:today(),ts:Date.now(),recibo,
+      usuarioId:S.user?S.user.id:'',usuario:S.user?S.user.nombre:''};
+    const r=this.repartirAbono(cid,monto,datos);
+    await persist();
+    S.ctx.ultimoAbono={cid,monto,recibo,metodo,referencia,fecha:datos.fecha,ts:datos.ts,
+      aplicado:r.aplicado, restante:deuda-monto};
+    render();
+    const saldadas=r.aplicado.filter(a=>a.quedo<1).length;
+    toast(`Abono de ${$(monto)} · quedan debiendo ${$(deuda-monto)}`+(saldadas?` · ${saldadas} deuda${saldadas===1?'':'s'} saldada${saldadas===1?'':'s'}`:''));
+  },
+  reciboAbono(){
+    const a=S.ctx.ultimoAbono; if(!a) return;
+    const lineas=a.aplicado.map(x=>[`${fechaCorta(x.fecha)} · ${(x.detalle||'Deuda').slice(0,26)}`, $(x.parte)]);
+    lineas.push(['—— Abono total ——', $(a.monto)]);
+    lineas.push(['Le queda debiendo', $(a.restante)]);
+    generarFactura({cliente:cliente(a.cid).nombre, telefono:(cliente(a.cid).contacto||''),
+      lineas, total:a.monto, pago:a.metodo==='efectivo'?'Efectivo':'Transferencia',
+      fecha:a.fecha, ts:a.ts, folio:a.recibo, ref:a.referencia, titulo:'RECIBO DE ABONO'});
+  },
+  cerrarAviso(){ S.ctx.ultimoAbono=null; render(); },
   async abonar(fid){
     const f=DB.fiados.find(x=>x.id===fid); const saldo=saldoFiado(f);
     const v=prompt(`Saldo de ${cliente(f.clienteId).nombre}: ${$(saldo)}\n¿Cuánto abona?`);
@@ -1663,7 +1769,7 @@ const App = {
     if(!esAdmin()){ toast('Solo el administrador'); return; }
     /* Blindaje explicito: estas llaves NO se tocan jamas en este reset. */
     const PROTEGIDAS=['productos','clientes','usuarios','insumos','proveedores','negocio','licencia','creatorPin'];
-    const OPERATIVAS=['dias','fiados','compras','cotizaciones','deudas'];
+    const OPERATIVAS=['dias','fiados','compras','cotizaciones','deudas','papelera'];
     const antes={}; PROTEGIDAS.forEach(k=>antes[k]=JSON.stringify(DB[k]));
     const mov=(DB.dias||[]).reduce((t,d)=>t+d.mayoreo.length+(d.libres||[]).length+d.gastos.length+d.mermas.length+(d.devoluciones||[]).length,0);
     if(!mov && !(DB.fiados||[]).length){ toast('Ya está limpio, no hay movimientos'); return; }
@@ -1939,7 +2045,23 @@ const App = {
     S.ctx={};
     await persist(); App.volverAjustes('prod'); toast('Producto guardado');
   },
-  async delProd(id){ if(!confirm('¿Eliminar este producto?')) return; DB.productos=DB.productos.filter(p=>p.id!==id); await persist(); App.volverAjustes('prod'); toast('Producto eliminado'); },
+  async delProd(id){
+    /* Si ya se vendió, borrarlo dejaría las ventas viejas sin nombre ni costo. */
+    const usos=(DB.dias||[]).reduce((t,d)=>t+d.mayoreo.filter(m=>lineasVenta(m).some(l=>l.prodId===id)).length,0);
+    if(usos>0){
+      const p=prod(id);
+      if(!confirm('"'+p.nombre+'" ya aparece en '+usos+' venta'+(usos===1?'':'s')+'.\n\n'
+        +'Si lo borras, esas ventas quedan sin nombre y sin costo, y la ganancia de esos días se daña.\n\n'
+        +'Mejor lo ESCONDO: sale del formulario de venta pero el historial se conserva.\n\n'
+        +'Aceptar = esconder (recomendado) · Cancelar = no hacer nada')) return;
+      prod(id).activo=false;
+      await persist(); App.volverAjustes('prod'); toast('Producto escondido — el historial quedó intacto');
+      return;
+    }
+    if(!confirm('¿Eliminar este producto?')) return;
+    DB.productos=DB.productos.filter(p=>p.id!==id);
+    await persist(); App.volverAjustes('prod'); toast('Producto eliminado');
+  },
   async editInsumo(id){ S.ctx={editId:id||null}; S.view='form'; S.sub='insedit'; render(); window.scrollTo(0,0); },
   async saveInsumo(){
     const id=S.ctx.editId;
@@ -1968,14 +2090,84 @@ const App = {
   compraTipoChange(){ S.ctx.compraTipo=document.getElementById('co_tipo').value; render(); },
   async delRegistro(tipo,id){
     const j=dia(); if(!j) return;
-    if(!confirm('¿Quitar este registro del día?')) return;
+    const lista = tipo==='libre'?(j.libres||[]) : tipo==='mayoreo'?j.mayoreo
+                : tipo==='merma'?j.mermas : tipo==='gasto'?j.gastos : (j.devoluciones||[]);
+    const reg=lista.find(x=>x.id===id); if(!reg) return;
+
+    /* Si el cliente ya abonó sobre esta venta, borrarla borraría plata recibida. */
+    const fiadosLig=(tipo==='libre'||tipo==='mayoreo') ? DB.fiados.filter(f=>f.origen===id) : [];
+    const abonado=fiadosLig.reduce((t,f)=>t+(f.abonos||[]).reduce((x,a)=>x+montoAbono(a),0),0);
+    if(abonado>0){
+      const recibos=[...new Set(fiadosLig.flatMap(f=>(f.abonos||[]).map(a=>a.recibo).filter(Boolean)))];
+      if(!confirm('CUIDADO\n\nEste cliente ya abonó '+$(abonado)+' sobre esta venta'
+        +(recibos.length?' (recibo '+recibos.join(', ')+')':'')
+        +'.\n\nSi la borras, esa plata desaparece del Balance y el recibo que el cliente tiene queda sin respaldo.\n\n¿Aun así quieres borrarla?')) return;
+      if(!confirm('Confírmame otra vez: se van a borrar '+$(abonado)+' ya recibidos.')) return;
+    } else {
+      if(!confirm('¿Quitar este registro del día?')) return;
+    }
+
+    /* Nada se destruye: se guarda en la papelera con todo lo que arrastra. */
+    DB.papelera.unshift({id:uid(),tipo,fecha:j.fecha,borrado:today(),ts:Date.now(),
+      usuario:S.user?S.user.nombre:'', registro:reg, fiados:fiadosLig});
+    DB.papelera=DB.papelera.slice(0,80);
+
     if(tipo==='libre') j.libres=(j.libres||[]).filter(x=>x.id!==id);
     if(tipo==='mayoreo') j.mayoreo=j.mayoreo.filter(x=>x.id!==id);
     if(tipo==='libre'||tipo==='mayoreo') DB.fiados=DB.fiados.filter(f=>f.origen!==id);
     if(tipo==='merma') j.mermas=j.mermas.filter(x=>x.id!==id);
     if(tipo==='gasto') j.gastos=j.gastos.filter(x=>x.id!==id);
     if(tipo==='devolucion') j.devoluciones=(j.devoluciones||[]).filter(x=>x.id!==id);
-    await persist(); render(); toast('Registro quitado');
+    await persist(); render(); toast('Quitado — puedes recuperarlo en Mi negocio');
+  },
+  bajarRespaldo(){
+    const copia=JSON.parse(JSON.stringify(DB));
+    delete copia.creatorPin;                       /* el PIN no viaja en el respaldo */
+    const paquete={nexbit:1, version:2, negocio:(DB.negocio||{}).nombre||'', creado:new Date().toISOString(), db:copia};
+    const blob=new Blob([JSON.stringify(paquete)],{type:'application/json'});
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download='respaldo-'+((DB.negocio||{}).nombre||'nexbit').toLowerCase().replace(/[^a-z0-9]+/g,'-')+'-'+today()+'.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    DB.ultimoRespaldo=today(); persist();
+    toast('Respaldo descargado — guárdalo en Drive o WhatsApp');
+  },
+  async subirRespaldo(ev){
+    const f=ev.target.files&&ev.target.files[0]; if(!f) return;
+    ev.target.value='';
+    try{
+      const txt=await f.text();
+      const paq=JSON.parse(txt);
+      const nueva=paq && paq.db ? paq.db : paq;
+      if(!nueva || !Array.isArray(nueva.dias) || !Array.isArray(nueva.productos))
+        { toast('Ese archivo no es un respaldo de Nexbit'); return; }
+      const nV=(nueva.dias||[]).reduce((t,d)=>t+(d.mayoreo||[]).length+(d.libres||[]).length,0);
+      const aV=(DB.dias||[]).reduce((t,d)=>t+(d.mayoreo||[]).length+(d.libres||[]).length,0);
+      if(!confirm('RESTAURAR RESPALDO\n\n'
+        +'Del '+(paq.creado?paq.creado.slice(0,10):'fecha desconocida')+'\n'
+        +'Trae: '+(nueva.productos||[]).length+' productos, '+(nueva.clientes||[]).length+' clientes, '+nV+' ventas.\n\n'
+        +'Lo que tienes ahora ('+aV+' ventas) se reemplaza por completo.\n\n¿Seguro?')) return;
+      if(!confirm('Última confirmación: se reemplaza TODA la información actual.')) return;
+      const pinActual=DB.creatorPin, licActual=DB.licencia;
+      DB=nueva;
+      DB.creatorPin=pinActual;                      /* el PIN y la licencia no se restauran */
+      DB.licencia=licActual;
+      sanea();
+      await persist(); S.ctx={}; S.view='inicio'; render();
+      toast('Respaldo restaurado');
+    }catch(e){ toast('No se pudo leer el archivo'); }
+  },
+  async restaurar(pid){
+    const it=(DB.papelera||[]).find(x=>x.id===pid); if(!it) return;
+    let d=DB.dias.find(x=>x.fecha===it.fecha);
+    if(!d){ d={id:uid(),fecha:it.fecha,mayoreo:[],libres:[],gastos:[],mermas:[],devoluciones:[]}; DB.dias.push(d); }
+    d.mayoreo=d.mayoreo||[]; d.libres=d.libres||[]; d.gastos=d.gastos||[]; d.mermas=d.mermas||[]; d.devoluciones=d.devoluciones||[];
+    const destino = it.tipo==='libre'?d.libres : it.tipo==='mayoreo'?d.mayoreo
+                  : it.tipo==='merma'?d.mermas : it.tipo==='gasto'?d.gastos : d.devoluciones;
+    if(!destino.some(x=>x.id===it.registro.id)) destino.push(it.registro);
+    (it.fiados||[]).forEach(f=>{ if(!DB.fiados.some(x=>x.id===f.id)) DB.fiados.push(f); });
+    DB.papelera=DB.papelera.filter(x=>x.id!==pid);
+    await persist(); render(); toast('Recuperado en '+fmtFecha(it.fecha));
   },
   async toggleVerif(id){
     const _d=dia(); const m=_d&&(_d.mayoreo.find(x=>x.id===id)||(_d.libres||[]).find(x=>x.id===id)); if(!m) return;
@@ -2058,6 +2250,7 @@ document.addEventListener('input',e=>{ if(e.target.id==='f_precio') e.target.dat
    Acceso al panel oculto: toca el logo (login/bloqueo) o la marca de arriba
    5 veces y entra con el PIN de creador (DB.creatorPin, por defecto 2468). */
 const GRACIA_DIAS = 7;
+let _revLocal = 0;
 function sumarDias(fechaISO,n){
   const b=(fechaISO||today()).split('-');
   const d=new Date(+b[0],+b[1]-1,+b[2]); d.setDate(d.getDate()+n);
@@ -2181,7 +2374,9 @@ function sanea(){
   if(DB.negocio.configurado===undefined) DB.negocio.configurado=true;
   if(DB.negocio.usaInsumos===undefined) DB.negocio.usaInsumos=true;
   if(!DB.consecutivo) DB.consecutivo=1;
+  if(!DB.consecutivoAbono) DB.consecutivoAbono=1;
   DB.deudas=DB.deudas||[];
+  DB.papelera=DB.papelera||[];
   // ---- Migración al libro por fechas (corre una sola vez) ----
   if(!DB.dias){
     DB.dias=[];
@@ -2241,9 +2436,16 @@ function vigilarConexion(){
   const lic=await checkLicense();
   if(lic.locked){ S.locked=true; S.lockReason=lic.reason; }
   render();
-  Store.subscribe(remote=>{
+  Store.subscribe((remote,rev)=>{
+    if(rev>_revLocal) _revLocal=rev;
+    const editando = S.view==='form' || S.creator;
     DB=remote; sanea();
-    if(!S.creator && !['form','abrir','cierre'].includes(S.view)) render();
+    if(editando){
+      /* Otro celular guardó mientras este escribía: avisar, no borrar lo tecleado. */
+      toast('Otro dispositivo registró algo. Guarda lo tuyo para no perderlo.');
+      return;
+    }
+    render();
   });
 })();
 </script>
