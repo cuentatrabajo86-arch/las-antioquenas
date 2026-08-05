@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<meta name="theme-color" content="#00ADEF">
+<meta name="theme-color" content="#F4F8FC">
 <title>Nexbit POS — Punto de venta</title>
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
@@ -181,6 +181,15 @@ body.offline .topbar::after{content:'Sin internet';margin-left:auto;flex:0 0 aut
 .mpick b{font-size:13.5px;font-weight:800}
 .mpick .mico{display:flex}
 .mpick.on{border-color:#7FCDF2;background:linear-gradient(180deg,#F2FAFF,#E6F5FE);color:#0079BF;box-shadow:0 0 0 3px rgba(0,173,239,.10)}
+.btn-ojo{border:none;background:none;padding:0 0 0 6px;font:inherit;font-size:11.5px;font-weight:800;color:var(--mango-text);cursor:pointer;text-decoration:underline}
+.compbox{display:flex;align-items:center;gap:12px;border:1px dashed #A9D8F4;background:#F5FBFF;border-radius:14px;padding:12px;margin:14px 0 10px}
+.compimg{width:52px;height:52px;object-fit:cover;border-radius:10px;border:1px solid var(--line);flex:0 0 auto;cursor:pointer}
+.comptx{flex:1;min-width:0}
+.comptx b{display:block;font-size:13.5px;font-weight:800;color:var(--ink)}
+.comptx span{display:block;font-size:11.5px;color:var(--ink-soft);margin-top:2px}
+.visor{position:fixed;inset:0;z-index:80;background:rgba(8,19,29,.92);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:20px}
+.visor img{max-width:100%;max-height:80vh;border-radius:12px;box-shadow:0 20px 60px -20px #000}
+.vcerrar{border:none;border-radius:12px;padding:12px 26px;background:#fff;color:var(--ink);font:inherit;font-size:14px;font-weight:800;cursor:pointer}
 .dprog{height:7px;border-radius:99px;background:var(--line);overflow:hidden;margin:10px 0 8px}
 .dprog i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--verde),#5BD3C7)}
 .lincard{border:1px solid var(--line);border-radius:14px;padding:2px 14px;margin-bottom:16px;background:var(--bg-subtle,#FAF6EE)}
@@ -364,11 +373,53 @@ const FIREBASE_CONFIG = {
 const USE_FIRESTORE = !!(window.firebase && FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.apiKey.indexOf('PEGA_AQUI')===-1);
 const LKEY='las_antioquenas_db_v1';
 let _docRef=null;
+/* Los comprobantes NO viven en app/data: cada foto va en su propio documento.
+   Si fueran al documento principal, 16 fotos reventarían la base y cada venta
+   reenviaría todas las imágenes por el aire. */
+async function guardarComprobante(dataUrl){
+  if(!dataUrl) return null;
+  const id='c'+uid();
+  if(USE_FIRESTORE && _fsRef){
+    try{ await _fsRef.collection('comprobantes').doc(id).set({img:dataUrl, ts:Date.now()}); return id; }catch(e){}
+  }
+  try{ if(window.storage){ await window.storage.set('comp_'+id, dataUrl); return id; } }catch(e){}
+  return null;
+}
+async function leerComprobante(id){
+  if(!id) return null;
+  if(USE_FIRESTORE && _fsRef){
+    try{ const d=await _fsRef.collection('comprobantes').doc(id).get(); if(d.exists) return d.data().img; }catch(e){}
+  }
+  try{ if(window.storage){ const r=await window.storage.get('comp_'+id); return r?r.value:null; } }catch(e){}
+  return null;
+}
+/* Comprime fuerte: un pantallazo de Nequi baja de ~100KB a ~20KB sin perder lectura */
+function comprimirFoto(file, ladoMax=760, tope=42000){
+  return new Promise((ok,no)=>{
+    const r=new FileReader();
+    r.onload=()=>{
+      const im=new Image();
+      im.onload=()=>{
+        let w=im.width, h=im.height;
+        const esc=Math.min(1, ladoMax/Math.max(w,h));
+        w=Math.round(w*esc); h=Math.round(h*esc);
+        const c=document.createElement('canvas'); c.width=w; c.height=h;
+        const g=c.getContext('2d'); g.fillStyle='#fff'; g.fillRect(0,0,w,h); g.drawImage(im,0,0,w,h);
+        let q=0.6, out=c.toDataURL('image/jpeg',q);
+        while(out.length>tope && q>0.28){ q-=0.08; out=c.toDataURL('image/jpeg',q); }
+        ok(out.length>tope? null : out);
+      };
+      im.onerror=()=>no(); im.src=r.result;
+    };
+    r.onerror=()=>no(); r.readAsDataURL(file);
+  });
+}
 async function initFirestore(){
   firebase.initializeApp(FIREBASE_CONFIG);
   const fs=firebase.firestore();
   fs.enablePersistence({synchronizeTabs:true}).catch(()=>{});
   _docRef=fs.collection('app').doc('data');
+  _fsRef=fs;
   /* Sesion anonima: la exigen las reglas de seguridad.
      Si Auth anonima no esta activada en la consola, seguimos igual:
      con reglas abiertas funciona, y con reglas cerradas cae a modo local. */
@@ -463,16 +514,28 @@ function movimientos(desde,hasta){
       detalle:x.concepto||'Devolución', monto:x.monto, metodo:'Efectivo', fecha:d.fecha, ts:x.ts,
       estado:'Devuelto', debe:0}));
   });
-  /* Los abonos son plata que entra el día que la reciben, no el día de la venta. */
+  /* Los abonos entran el día que se reciben. Un abono repartido entre varias
+     deudas es UN SOLO pago: se agrupa por recibo para no verse como pagos repetidos. */
+  const _pagos={};
   (DB.fiados||[]).forEach(f=>{
     (f.abonos||[]).forEach(a=>{
       const monto=montoAbono(a); if(monto<=0) return;
       const fecha=(a && a.fecha) || f.fecha;
       if(fecha<desde||fecha>hasta) return;
-      ing.push({nombre:cliente(f.clienteId).nombre, detalle:'Abono a deuda · '+(f.detalle||''),
-        monto, metodo:(a&&a.metodo)?(a.metodo==='efectivo'?'Efectivo':'Transferencia'):'Efectivo',
-        fecha, ts:a&&a.ts, estado:'Abono', debe:0});
+      const recibo=(a&&a.recibo)||null;
+      const llave = recibo ? (f.clienteId+'|'+recibo) : ('x'+Math.random());
+      if(!_pagos[llave]) _pagos[llave]={nombre:cliente(f.clienteId).nombre, recibo, cubre:0,
+        monto:0, metodo:(a&&a.metodo==='transferencia')?'Transferencia':'Efectivo',
+        fecha, ts:(a&&a.ts)||0, estado:'Abono', debe:0, comprobante:null};
+      if(a&&a.comprobante && !_pagos[llave].comprobante) _pagos[llave].comprobante=a.comprobante;
+      _pagos[llave].monto+=monto;
+      _pagos[llave].cubre++;
+      if((a&&a.ts||0)>_pagos[llave].ts) _pagos[llave].ts=a.ts;
     });
+  });
+  Object.values(_pagos).forEach(p=>{
+    p.detalle = 'Abono' + (p.recibo?' '+p.recibo:'') + (p.cubre>1?` · cubrió ${p.cubre} deudas`:' a deuda');
+    ing.push(p);
   });
   (DB.compras||[]).forEach(c=>{
     if(!c.fecha||c.fecha<desde||c.fecha>hasta) return;
@@ -500,6 +563,13 @@ function precioAplicable(prodId, qty){
   const usaMayor = qty>=umbral && (p.mayoreo||0)>0;
   const precio = usaMayor ? p.mayoreo : (p.menudeo||p.mayoreo||0);
   return {precio, tipo: usaMayor?'mayoreo':'menudeo', umbral, bajoCosto: (p.costo||0)>0 && precio < p.costo};
+}
+function uniPlural(u){ u=u||'unidad';
+  if(u==='kg'||u==='ml'||u==='g') return u;      /* abreviaturas no se pluralizan */
+  if(/ón$/.test(u)) return u.slice(0,-2)+'ones'; /* galón -> galones */
+  if(/s$/.test(u)) return u;
+  if(/[aeiouáéíóú]$/.test(u)) return u+'s';      /* libra -> libras */
+  return u+'es';                                 /* unidad -> unidades */
 }
 const UNIDADES=['unidad','libra','kg','gramo','litro','ml','metro','caja','paquete','docena','bulto','galón','servicio','hora'];
 /* Presets por tipo de negocio: productos de arranque y si maneja materia prima */
@@ -617,6 +687,7 @@ function toast(msg){
 
 /* ================================ ICONS ================================ */
 const I={
+  vuelta:'<path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/>',
   card:'<rect x="2.5" y="5.5" width="19" height="13" rx="2.5"/><path d="M2.5 10.2h19M6 15h4"/>',
   home:'<path d="M3 10.6 12 3.2l9 7.4"/><path d="M5.6 9.4V20.8h12.8V9.4"/><path d="M9.9 20.8v-6h4.2v6"/>',
   search:'<circle cx="11" cy="11" r="6.4"/><path d="M20.2 20.2 16.5 16.5"/>',
@@ -671,14 +742,24 @@ function setupView(){
     <button class="btn btn-primary" onclick="App.terminarSetup()">Empezar a vender</button>
   </div></div>`;
 }
+const TFG={venta:'Nueva venta',deuda:'Anotar lo que debes',gasto:'Gasto',
+  merma:'Se dañó un producto',devolucion:'Devolver plata',coti:'Cotización',compra:'Registrar compra'};
+/* La barra dice exactamente lo mismo que el título de la pantalla. */
+function tituloForm(){
+  const sub=S.sub, ed=S.ctx&&S.ctx.editId;
+  if(sub==='abono') return (S.ctx.abono&&S.ctx.abono.modo==='pago') ? 'Pagar deuda' : 'Registrar abono';
+  if(sub==='prodedit') return ed?'Editar producto':'Nuevo producto';
+  if(sub==='cliedit')  return ed?'Editar cliente':'Nuevo cliente';
+  if(sub==='insedit')  return ed?'Editar insumo':'Nuevo insumo';
+  if(sub==='provedit') return ed?'Editar proveedor':'Nuevo proveedor';
+  return TFG[sub]||'Registrar';
+}
 function topbar(){
-  const T={inicio:'Inicio',registrar:'Nueva venta',buscar:'Balance',cobros:'Cuentas por cobrar',deudas:'Mis deudas',ajustes:'Ajustes',informe:'Informe del día',form:'Registrar'};
-  const TF={venta:'Nueva venta',abono:'Registrar abono',deuda:'Anotar deuda',gasto:'Nuevo gasto',
-    merma:'Se dañó un producto',devolucion:'Devolver plata',coti:'Cotización',compra:'Compra a proveedor',
-    prodedit:'Producto',cliedit:'Cliente',insedit:'Insumo',provedit:'Proveedor'};
+  const T={inicio:'Inicio',registrar:'Registrar',buscar:'Balance',cobros:'Te deben',deudas:'Tú debes',ajustes:'Ajustes',informe:'Informe del día',form:'Registrar'};
+
   return `<div class="topbar">
     <button class="burger" onclick="App.toggleDrawer()" aria-label="Abrir menú">${svg('menu')}</button>
-    <div class="tbtitle">${S.view==='form' ? (TF[S.sub]||'Registrar') : (T[S.view]||'Inicio')}</div>
+    <div class="tbtitle">${S.view==='form' ? tituloForm() : (T[S.view]||'Inicio')}</div>
     <div class="userchip rol-${S.user.rol}"><span class="dot"></span>${S.user.nombre}</div>
   </div>`;
 }
@@ -695,10 +776,10 @@ function navbar(){
     <nav class="dnav">
       <div class="dgrp">Operaciones</div>
       ${it(S.view==='inicio','home','Inicio',"App.irA('inicio')")}
-      ${it(S.view==='registrar'||S.view==='form','plus','Nueva venta',"App.irA('registrar')")}
+      ${it(S.view==='registrar'||S.view==='form','plus','Registrar',"App.irA('registrar')")}
       ${it(S.view==='buscar','chart','Balance',"App.irA('buscar')")}
-      ${it(S.view==='cobros','money','Cuentas por cobrar',"App.irA('cobros')")}
-      ${esAdmin()?it(S.view==='deudas','card','Mis deudas',"App.irA('deudas')"):''}
+      ${it(S.view==='cobros','money','Te deben',"App.irA('cobros')")}
+      ${esAdmin()?it(S.view==='deudas','card','Tú debes',"App.irA('deudas')"):''}
       ${esAdmin()?`
       <div class="dgrp">Catálogos</div>
       ${it(aj('prod'),'box','Productos',"App.irAjuste('prod')")}
@@ -764,7 +845,7 @@ function vInicio(){
     </div>
     ${deuda?`<div class="card" onclick="App.go('cobros')" style="cursor:pointer"><div class="row" style="border:none"><div><div class="lab">Te deben en total</div><div class="sub">Toca para ver a quién</div></div><div class="val" style="color:var(--coral);font-size:19px">${$(deuda)}</div></div></div>`:''}
     ${(esAdmin()&&saldoDeudasTotal()>0)?`<div class="card" onclick="App.irA('deudas')" style="cursor:pointer">
-        <div class="row" style="border:none;padding:0"><div><div class="lab">Debes en total</div><div class="sub">a proveedores y otros · toca para ver</div></div>
+        <div class="row" style="border:none;padding:0"><div><div class="lab">Tú debes en total</div><div class="sub">a proveedores y a otras personas · toca para ver</div></div>
         <div class="val" style="color:var(--coral);font-size:17px">${$(saldoDeudasTotal())}</div></div></div>`:''}
       <div class="btnrow">
       <button class="btn btn-primary" style="font-size:17px;padding:20px" onclick="App.nuevaVenta()">${svg('cart')} Nueva venta</button>
@@ -823,8 +904,14 @@ function vBalance(){
   const tIng = ing.reduce((t,x)=>t+x.monto,0), tEgr = egr.reduce((t,x)=>t+x.monto,0);
   const bal = tIng - tEgr;
   /* Ganancia real del periodo: lo vendido menos lo que costo, menos gastos. */
-  const gan = (DB.dias||[]).filter(d=>d.fecha>=desde&&d.fecha<=hasta)
-                .reduce((t,d)=>t+(calcular(d).tot.gananciaNeta||0),0);
+  const _dd = (DB.dias||[]).filter(d=>d.fecha>=desde&&d.fecha<=hasta).map(d=>calcular(d).tot);
+  const gan = _dd.reduce((t,x)=>t+(x.gananciaNeta||0),0);
+  /* Cuánto de lo vendido en el periodo salió fiado: la ganancia lo incluye. */
+  const ganFiado = _dd.reduce((t,x)=>t+(x.ingMayoreoFiado||0)+(x.ingLibresFiado||0),0);
+  /* Productos vendidos sin costo cargado inflan la ganancia. */
+  const sinCosto = [...new Set((DB.dias||[]).filter(d=>d.fecha>=desde&&d.fecha<=hasta)
+    .flatMap(d=>d.mayoreo.flatMap(m=>lineasVenta(m).map(l=>l.prodId).filter(Boolean))))]
+    .filter(id=>!(prod(id).costo>0));
 
   const per_ = (v,lb)=>`<button class="${per===v?'on':''}" onclick="App.periodo('${v}')">${lb}</button>`;
   const flechaUp='<svg viewBox="0 0 24 24"><path d="M7 17 17 7"/><path d="M8.5 7H17v8.5"/></svg>';
@@ -835,7 +922,7 @@ function vBalance(){
     ? `<div class="card" style="padding:4px 16px">${arr.map(x=>`
         <div class="movrow">
           <div class="movico ${tipo}">${billete}</div>
-          <div class="movtx"><b>${x.nombre}</b><span>${x.metodo} · ${selloFecha(x.fecha,x.ts)}</span></div>
+          <div class="movtx"><b>${x.nombre}</b><span>${x.metodo} · ${selloFecha(x.fecha,x.ts)}${x.comprobante?` · <button class="btn-ojo" onclick="App.verFoto('${x.comprobante}')">ver comprobante</button>`:''}</span></div>
           <div class="movder">
             <b style="color:${tipo==='i'?'var(--verde)':'var(--coral)'}">${tipo==='i'?'':'&minus;'}${$(x.monto)}</b>
             <span style="color:${x.debe>0?'var(--warn)':'var(--verde)'}">${x.debe>0?'Debe '+$(x.debe):x.estado}</span>
@@ -870,6 +957,8 @@ function vBalance(){
         <div><div class="lab">Ganancia del periodo</div><div class="sub">Lo vendido menos el costo y los gastos</div></div>
         <div class="val" style="color:${gan>=0?'var(--verde)':'var(--coral)'};font-size:17px">${$(gan)}</div>
       </div>
+      ${ganFiado>0?`<div class="sub" style="padding:0 0 12px;color:var(--warn)">Ojo: ${$(ganFiado)} de eso lo vendiste fiado, todavía no entra a caja.</div>`:''}
+      ${sinCosto.length?`<div class="sub" style="padding:0 0 12px;color:var(--warn)">${sinCosto.length} producto${sinCosto.length===1?'':'s'} sin costo cargado (${sinCosto.slice(0,3).map(id=>prod(id).nombre).join(', ')}${sinCosto.length>3?'…':''}). La ganancia sale más alta de lo real.</div>`:''}
     </div>
 
     <div class="card" style="padding:14px 16px">
@@ -936,7 +1025,7 @@ function vRegistrar(){
       <button class="tile" onclick="App.form('coti')"><div class="ico">${svg('tag')}</div><b>Cotización</b><span>Pásale el precio al cliente</span></button>
       <button class="tile aji" onclick="App.form('merma')"><div class="ico">${svg('warn')}</div><b>Se dañó un producto</b><span>Se pierde mercancía</span></button>
       <button class="tile" onclick="App.form('gasto')"><div class="ico">${svg('money')}</div><b>Gasto</b><span>Hielo, aceite, gas…</span></button>
-      <button class="tile aji" onclick="App.form('devolucion')"><div class="ico">${svg('warn')}</div><b>Devolver plata</b><span>Le regresas dinero al cliente</span></button>
+      <button class="tile aji" onclick="App.form('devolucion')"><div class="ico">${svg('vuelta')}</div><b>Devolver plata</b><span>Le regresas dinero al cliente</span></button>
     </div>
     <div class="card" style="margin-top:6px"><h3>Productos</h3><p style="color:var(--ink-soft);font-size:13px;margin-bottom:12px">¿Falta un producto para vender? Créalo o edítalo aquí.</p><button class="btn btn-line" onclick="App.go('ajustes');App.sub('prod')">Crear o editar productos</button></div>
     ${j?resumenRegistros():''}`;
@@ -1004,13 +1093,21 @@ function vForm(){
           ${bt('transferencia','Transferencia','<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 9h16M4 9l4-4M4 9l4 4"/><path d="M20 15H4m16 0-4-4m4 4-4 4"/></svg>')}
         </div>
         ${a.metodo==='transferencia'?`<label class="fld" style="margin-top:14px"><span>Referencia <span style="font-weight:500;text-transform:none">(opcional)</span></span>
-          <input type="text" id="ab_ref" value="${(a.referencia||'').replace(/"/g,'&quot;')}" placeholder="N.º de la transferencia"></label>`:''}
+          <input type="text" id="ab_ref" value="${(a.referencia||'').replace(/"/g,'&quot;')}" placeholder="N.º de la transferencia"></label>
+        <div class="compbox">
+          ${a.foto?`<img src="${a.foto}" alt="Comprobante" class="compimg" onclick="App.verFoto('${'ya'}')">
+            <div class="comptx"><b>Comprobante listo</b><span>Se guarda junto al pago</span></div>
+            <button class="linx" onclick="App.quitarFoto()">×</button>`
+          :`<div class="comptx"><b>Comprobante</b><span>Toma la foto del pago o súbela de la galería</span></div>`}
+        </div>
+        ${!a.foto?`<input type="file" accept="image/*" capture="environment" id="ab_foto" style="display:none" onchange="App.subirFoto(event)">
+          <button class="btn btn-line" onclick="document.getElementById('ab_foto').click()">${svg('card')} Adjuntar comprobante</button>`:''}`:''}
         <div id="ab_res" class="hint" style="font-size:14.5px;margin-top:14px"></div>
       </div>
       <button class="btn btn-primary" onclick="App.guardarAbono()">${a.modo==='pago'?'Guardar el pago':'Guardar el abono'}</button>${back}`;
   }
   if(t==='deuda'){
-    return `<div class="view-title">Anotar una deuda</div><div class="view-sub">Plata que tu negocio debe. Los pagos que hagas saldrán como egresos.</div>
+    return `<div class="view-title">Anotar lo que debes</div><div class="view-sub">Plata que tu negocio le debe a alguien. Cada pago que hagas sale como egreso.</div>
       <div class="card">
         <label class="fld"><span>¿A quién le debes?</span><select id="d_tipo" onchange="document.getElementById('d_gprov').style.display=this.value==='proveedor'?'block':'none';document.getElementById('d_gnom').style.display=this.value==='proveedor'?'none':'block'">
           <option value="proveedor">A un proveedor</option><option value="persona">A una persona u otro</option></select></label>
@@ -1079,17 +1176,17 @@ function vForm(){
 
 
   if(t==='merma'){
-    return `<div class="view-title">Producto dañado</div><div class="view-sub">Producto que se dañó o que te devolvió un revendedor dañado. Cuenta como pérdida del día.</div>
+    return `<div class="view-title">Se dañó un producto</div><div class="view-sub">Producto que se dañó o que te devolvió un revendedor dañado. Cuenta como pérdida del día.</div>
       <div class="card">
         <label class="fld"><span>Producto</span><select id="f_prod">${opciones(DB.productos.filter(p=>p.activo))}</select><div class="hint" id="f_disp"></div></label>
         <label class="fld"><span>Cantidad dañada</span><input type="number" min="1" inputmode="numeric" id="f_qty" value="1"></label>
         ${esAdmin()? `<label class="fld"><div class="chk"><input type="checkbox" id="f_conf" checked><span style="text-transform:none;color:var(--tinta);font-weight:600;margin:0">Confirmo que recibí estas unidades dañadas</span></div></label>`
-          : `<div class="hint">El administrador confirma la merma al recibirla.</div>`}
+          : `<div class="hint">El administrador lo confirma al recibirlo.</div>`}
       </div>
-      <button class="btn btn-danger" onclick="App.saveMerma()">Registrar merma</button>${back}`;
+      <button class="btn btn-danger" onclick="App.saveMerma()">Registrar lo dañado</button>${back}`;
   }
   if(t==='gasto'){
-    return `<div class="view-title">Gasto del día</div><div class="view-sub">Sale de la caja (baja lo esperado en efectivo).</div>
+    return `<div class="view-title">Gasto</div><div class="view-sub">Sale de la caja (baja lo esperado en efectivo).</div>
       <div class="card">
         <label class="fld"><span>Concepto</span><input type="text" id="f_conc" placeholder="Hielo, aceite, gas, transporte…"></label>
         <label class="fld"><span>Monto</span><input type="number" min="0" inputmode="numeric" id="f_monto" placeholder="0"></label>
@@ -1097,7 +1194,7 @@ function vForm(){
       <button class="btn btn-primary" onclick="App.saveGasto()">Guardar gasto</button>${back}`;
   }
   if(t==='devolucion'){
-    return `<div class="view-title">Devolución</div><div class="view-sub">Plata que le devolviste a un cliente por un producto devuelto. Cuenta como egreso.</div>
+    return `<div class="view-title">Devolver plata</div><div class="view-sub">Plata que le devolviste a un cliente por un producto devuelto. Cuenta como egreso.</div>
       <div class="card">
         <label class="fld"><span>Cliente <span style="font-weight:500;text-transform:none">(opcional)</span></span><select id="d_cli"><option value="">Sin cliente</option>${DB.clientes.map(c=>`<option value="${c.id}">${c.nombre}</option>`).join('')}</select></label>
         <label class="fld"><span>¿Qué le devolvieron? <span style="font-weight:500;text-transform:none">(opcional)</span></span><input type="text" id="d_conc" placeholder="Ej. 10 empanadas frías"></label>
@@ -1117,8 +1214,12 @@ function vForm(){
         <label class="fld"><span>¿Cómo lo vendes?</span><select id="p_uni">${UNIDADES.map(u=>`<option value="${u}" ${(p.unidad||'unidad')===u?'selected':''}>Por ${u}</option>`).join('')}</select></label>
         <label class="fld"><span>Precio al detal (por ${p.unidad||'unidad'})</span><input type="number" min="0" inputmode="numeric" id="p_men" value="${p.menudeo||''}" placeholder="0"></label>
         <label class="fld"><span>Precio al por mayor (por ${p.unidad||'unidad'})</span><input type="number" min="0" inputmode="numeric" id="p_may" value="${p.mayoreo||''}" placeholder="0"></label>
-        <label class="fld"><span>El precio al por mayor arranca desde</span><input type="number" min="1" inputmode="numeric" id="p_umb" value="${p.umbral||1}" placeholder="1"></label>
-        <div class="hint">Si vende ${p.umbral||1} ${p.unidad||'unidad'}${(p.umbral||1)>1?'s':''} o más, la app pone sola el precio al por mayor. Deje 1 si siempre cobra mayoreo.</div>
+        <label class="fld"><span>¿Desde cuántas ${uniPlural(p.unidad)} cobras el precio al por mayor?</span>
+          <div style="display:flex;align-items:center;gap:10px">
+            <input type="number" min="1" inputmode="numeric" id="p_umb" value="${p.umbral||1}" placeholder="1" oninput="App.avisoUmbral()" style="flex:1">
+            <span style="font-size:14px;font-weight:700;color:var(--ink-soft);white-space:nowrap">${uniPlural(p.unidad)} o más</span>
+          </div></label>
+        <div class="hint" id="p_umbhint">Aquí va una CANTIDAD, no un precio. Ejemplo: si escribes 50, al vender 50 ${uniPlural(p.unidad)} o más la app cobra sola el precio al por mayor. Deja 1 si siempre cobras al por mayor.</div>
         <label class="fld"><span>Costo (lo que te cuesta)</span><input type="number" min="0" inputmode="numeric" id="p_cos" value="${rc!=null?Math.round(rc):(p.costo||'')}" ${rc!=null?'disabled':''}></label>
         ${rc!=null?`<div class="hint">Se calcula solo con la receta de abajo.</div>`:''}
       </div>
@@ -1229,7 +1330,7 @@ function vInforme(){
       <div class="stat pos"><b>${$(tot.gananciaNeta)}</b><span>Ganancia del día</span></div>
       <div class="stat"><b>${$(tot.ventasTotales)}</b><span>Ventas totales</span></div>
       <div class="stat"><b>${$(tot.gastos)}</b><span>Gastos</span></div>
-      <div class="stat neg"><b>${$(tot.costoMerma)}</b><span>Merma (costo)</span></div>
+      <div class="stat neg"><b>${$(tot.costoMerma)}</b><span>Producto dañado (costo)</span></div>
     </div>
     <div class="card"><h3>Unidades vendidas por producto</h3><div class="chartwrap"><canvas id="chart"></canvas></div></div>
     <div class="card"><h3>Detalle por producto</h3>
@@ -1352,9 +1453,9 @@ function vCobros(){
         </div>
         ${pagado>0?`<div class="dprog"><i style="width:${pct}%"></i></div>
         <div class="sub" style="margin-bottom:10px">Ha abonado ${$(pagado)} de ${$(original)} · ${pct}%</div>`:''}
-        <button class="btn btn-verde" onclick="App.cobrarCliente('${cid}')">Abonar a la deuda total</button>
-        <div class="hint" style="margin:8px 0 12px">El abono se descuenta empezando por la deuda más vieja.</div>
-        <div class="seclabel" style="margin:0 0 6px">Deudas de este cliente</div>
+        <button class="btn btn-verde" onclick="App.cobrarCliente('${cid}')">Registrar un pago</button>
+        <div class="hint" style="margin:8px 0 12px">Se descuenta empezando por lo más viejo que te debe.</div>
+        <div class="seclabel" style="margin:0 0 6px">Lo que te debe, venta por venta</div>
         ${orden.map(f=>{
           const sal=saldoFiado(f), ab=f.monto-sal;
           return `<div class="row">
@@ -1367,8 +1468,8 @@ function vCobros(){
       </div>`;
     }).join('');
 
-  return `<div class="view-title">Deudas por cobrar</div>
-    <div class="view-sub">${abiertos.length? `${$(total)} por cobrar en total`:'Nadie debe. Todo al día.'}</div>
+  return `<div class="view-title">Te deben</div>
+    <div class="view-sub">${abiertos.length? `${$(total)} sin cobrar en total`:'Nadie te debe. Todo al día.'}</div>
     ${ua?`<div class="card" style="border-color:var(--verde)">
       <div class="row" style="border:none;padding:0 0 10px"><div>
         <div class="lab">Abono de ${cliente(ua.cid).nombre}</div>
@@ -1379,8 +1480,8 @@ function vCobros(){
         <button class="btn btn-ghost btn-sm" style="width:auto" onclick="App.cerrarAviso()">Listo</button>
       </div></div>`:''}
     ${abiertos.length? `<div class="statgrid">
-        <div class="stat neg"><b>${$(total)}</b><span>Total en la calle</span></div>
-        <div class="stat"><b>${Object.keys(porCli).length}</b><span>Clientes deben</span></div>
+        <div class="stat neg"><b>${$(total)}</b><span>Te deben en total</span></div>
+        <div class="stat"><b>${Object.keys(porCli).length}</b><span>Clientes te deben</span></div>
       </div>${bloques}`
       : `<div class="empty">${svg('money')}<div>No hay fiados pendientes.</div></div>`}`;
 }
@@ -1413,12 +1514,12 @@ function vDeudas(){
       </div>
     </div>`;
   };
-  return `<div class="view-title">Mis deudas</div>
-    <div class="view-sub">Lo que tu negocio debe a proveedores y otras personas. Nadie más lo ve.</div>
+  return `<div class="view-title">Tú debes</div>
+    <div class="view-sub">Lo que tu negocio le debe a proveedores y a otras personas. Solo tú lo ves.</div>
     <div class="balcard azul"><div class="baltop"><span>Debes en total</span><b style="color:${total?'var(--coral)':'var(--verde)'}">${$(total)}</b></div>
       <div class="row" style="border:none;padding:12px 0 14px"><div class="sub">${abiertas.length?abiertas.length+' deuda'+(abiertas.length===1?'':'s')+' pendiente'+(abiertas.length===1?'':'s'):'Estás al día'}</div></div>
     </div>
-    <button class="btn btn-primary" onclick="App.form('deuda')">+ Anotar una deuda</button>
+    <button class="btn btn-primary" onclick="App.form('deuda')">+ Anotar algo que debes</button>
     <div style="height:16px"></div>
     ${abiertas.length?abiertas.map(fila).join(''):`<div class="empty">${svg('empty')}<div>No debes nada. Así da gusto.</div></div>`}
     ${pagadas.length?`<div class="seclabel">Pagadas</div>${pagadas.map(d=>`<div class="row"><div><div class="lab" style="text-decoration:line-through;color:var(--ink-soft)">${d.acreedor}</div><div class="sub">${d.concepto||''}</div></div><span class="pill v">Pagada · ${$(d.monto)}</span></div>`).join('')}`:''}`;
@@ -1429,9 +1530,9 @@ function vAjustes(){
   return `<div class="view-title">Ajustes</div><div class="view-sub">Configuración del negocio.</div>
     <div class="tiles">
       <button class="tile" onclick="App.sub('prod')"><div class="ico">${svg('box')}</div><b>Productos</b><span>Precios y costo</span></button>
-      <button class="tile" onclick="App.sub('cli')"><div class="ico">${svg('users')}</div><b>Clientes</b><span>Para el mayoreo</span></button>
+      <button class="tile" onclick="App.sub('cli')"><div class="ico">${svg('users')}</div><b>Clientes</b><span>Para venderles</span></button>
       <button class="tile" onclick="App.sub('emp')"><div class="ico">${svg('users')}</div><b>Empleados</b><span>Accesos y PIN</span></button>
-      <button class="tile" onclick="App.sub('hist')"><div class="ico">${svg('clock')}</div><b>Historial</b><span>Días cerrados</span></button>
+      <button class="tile" onclick="App.sub('hist')"><div class="ico">${svg('clock')}</div><b>Historial</b><span>Todos tus días</span></button>
       ${usaInsumos()?`<button class="tile aji" onclick="App.sub('ins')"><div class="ico">${svg('layers')}</div><b>Insumos</b><span>${insumosBajos().length?insumosBajos().length+' con stock bajo':'Materia prima'}</span></button>`:''}
       <button class="tile hoja" onclick="App.sub('prov')"><div class="ico">${svg('truck')}</div><b>Proveedores</b><span>A quién le compras</span></button>
       <button class="tile hoja" onclick="App.sub('neg')"><div class="ico">${svg('tag')}</div><b>Mi negocio</b><span>Datos de la factura</span></button>
@@ -1548,7 +1649,9 @@ function panelProveedores(){
 function panelProductos(){
   return `<div class="seclabel">Productos</div>${DB.productos.map(p=>`
     <div class="card"><div class="row" style="border:none">
-      <div><div class="lab">${p.nombre}</div><div class="sub">Por ${p.unidad||'unidad'} · Menudeo ${$(p.menudeo)} · Mayoreo ${$(p.mayoreo)} · Costo ${$(p.costo)}</div></div>
+      <div><div class="lab">${p.nombre}${!(p.costo>0)?' <span class="pill" style="background:var(--warn-bg);color:var(--warn)">sin costo</span>':''}</div>
+      <div class="sub">Por ${p.unidad||'unidad'} · Menudeo ${$(p.menudeo)} · Mayoreo ${$(p.mayoreo)} · Costo ${$(p.costo)}</div>
+      ${!(p.costo>0)?'<div class="sub" style="color:var(--warn)">Sin costo, la ganancia de este producto sale inflada.</div>':''}</div>
       <button class="btn btn-sm btn-line" onclick="App.editProd('${p.id}')">Editar</button></div></div>`).join('')}
     <button class="btn btn-ghost" onclick="App.editProd(null)">${svg('plus')} Nuevo producto</button>`;
 }
@@ -1562,13 +1665,13 @@ function panelClientes(){
 function panelEmpleados(){
   return `<div class="seclabel">Empleados</div>${DB.usuarios.map(u=>`
     <div class="card"><div class="row" style="border:none">
-      <div><div class="lab">${u.nombre}</div><div class="sub">${u.rol==='admin'?'Administrador':'Trabajador'} · PIN ${u.pin}</div></div>
+      <div><div class="lab">${u.nombre}</div><div class="sub">${u.rol==='admin'?'Administrador':'Trabajador'} · clave ${S.verPin===u.id?u.pin:'••••'} <button class="btn-ojo" onclick="event.stopPropagation();App.verPin('${u.id}')">${S.verPin===u.id?'ocultar':'ver'}</button></div></div>
       <div style="display:flex;gap:8px"><button class="btn btn-sm btn-line" onclick="App.editEmp('${u.id}')">Editar</button>${u.rol!=='admin'?`<button class="btn btn-sm btn-line" onclick="App.delEmp('${u.id}')">Quitar</button>`:''}</div></div></div>`).join('')}
     <button class="btn btn-ghost" onclick="App.addEmp()">${svg('plus')} Agregar trabajador</button>`;
 }
 
 /* --------------------------- Helpers de vista --------------------------- */
-function noDia(){return `<div class="view-title">Sin día abierto</div><div class="empty">${svg('box')}<div>Abre el día primero.</div><div style="height:14px"></div><button class="btn btn-primary btn-sm" onclick="App.go('inicio')">Ir a abrir el día</button></div>`;}
+function noDia(){return `<div class="view-title">Ese día está vacío</div><div class="empty">${svg('box')}<div>Todavía no has registrado nada en este día.</div><div style="height:14px"></div><button class="btn btn-primary btn-sm" onclick="App.go('inicio')">Ir a abrir el día</button></div>`;}
 
 /* ================================ LOGIN =============================== */
 function loginView(){
@@ -1769,12 +1872,40 @@ const App = {
                  : `Abona ${$(monto)} · ${a.modo==='cobro'?'le queda debiendo':'te quedarías debiendo'} <b style="color:var(--mango-text)">${$(queda)}</b>`);
     if(v>a.deuda && document.getElementById('ab_monto')) document.getElementById('ab_monto').value=a.deuda;
   },
+  async subirFoto(ev){
+    const f=ev.target.files&&ev.target.files[0]; ev.target.value='';
+    if(!f) return;
+    if(!/^image\//.test(f.type)){ toast('Escoge una imagen'); return; }
+    toast('Preparando la foto...');
+    const g=i=>(document.getElementById(i)||{}).value||'';
+    S.ctx.abono=Object.assign({},S.ctx.abono,{monto:g('ab_monto'), referencia:g('ab_ref')});
+    try{
+      const data=await comprimirFoto(f);
+      if(!data){ toast('Esa foto pesa mucho, prueba con otra'); return; }
+      S.ctx.abono.foto=data; render();
+    }catch(e){ toast('No se pudo leer la foto'); }
+  },
+  quitarFoto(){
+    const g=i=>(document.getElementById(i)||{}).value||'';
+    S.ctx.abono=Object.assign({},S.ctx.abono,{monto:g('ab_monto'), referencia:g('ab_ref'), foto:null});
+    render();
+  },
+  async verFoto(id){
+    const data = (id==='ya') ? (S.ctx.abono&&S.ctx.abono.foto) : await leerComprobante(id);
+    if(!data){ toast('No se encontró el comprobante'); return; }
+    const d=document.createElement('div'); d.className='visor';
+    d.innerHTML=`<img src="${data}" alt="Comprobante"><button class="vcerrar">Cerrar</button>`;
+    d.onclick=()=>d.remove();
+    document.body.appendChild(d);
+  },
   async guardarAbono(){
     const a=S.ctx.abono; if(!a) return;
     const monto=Math.min(parseInt((document.getElementById('ab_monto')||{}).value)||0, a.deuda);
     if(monto<1){ toast('Escribe cuánto '+(a.modo==='cobro'?'abona':'pagas')); return; }
     const referencia=((document.getElementById('ab_ref')||{}).value||'').trim();
-    const base={metodo:a.metodo, referencia, fecha:today(), ts:Date.now(),
+    let comprobante=null;
+    if(a.foto){ toast('Guardando el comprobante...'); comprobante=await guardarComprobante(a.foto); }
+    const base={metodo:a.metodo, referencia, comprobante, fecha:today(), ts:Date.now(),
       usuarioId:S.user?S.user.id:'', usuario:S.user?S.user.nombre:''};
 
     if(a.modo==='pago'){
@@ -1817,6 +1948,8 @@ const App = {
     toast('Entraste como soporte — la app sigue bloqueada para el cliente');
   },
   abrirCreador(){ this.closeDrawer(); S.creator=true; render(); },
+  verPin(id){ S.verPin = (S.verPin===id) ? null : id; render();
+    clearTimeout(this._tp); this._tp=setTimeout(()=>{ if(S.verPin){ S.verPin=null; render(); } }, 8000); },
   cerrarAviso(){ S.ctx.ultimoAbono=null; render(); },
 
   /* ---- Config CRUD (admin) ---- */
@@ -2063,7 +2196,8 @@ const App = {
       }
       const precio=parseInt((pr||{}).value)||0;
       const p=prod(pid), ev=precioAplicable(pid,qty);
-      aviso=`Precio ${ev.tipo==='mayoreo'?'al por mayor':'al detal'}`+(ev.umbral>1?` (mayoreo desde ${ev.umbral})`:'');
+      aviso=`Precio ${ev.tipo==='mayoreo'?'al por mayor':'al detal'}`
+        +(ev.umbral>1?` · el mayoreo arranca en ${ev.umbral} ${uniPlural(p.unidad)}`:'');
       if(p && (p.costo||0)>0 && precio>0 && precio<p.costo) aviso+=` · OJO: por debajo del costo (${$(p.costo)})`;
     }
     const carrito=S.ctx.carrito||[];
@@ -2131,6 +2265,16 @@ const App = {
     render();
   },
   quitarInsumoReceta(idx){ S.ctx.receta.splice(idx,1); render(); },
+  avisoUmbral(){
+    const v=parseInt((document.getElementById('p_umb')||{}).value)||0;
+    const h=document.getElementById('p_umbhint'); if(!h) return;
+    if(v>=500){
+      h.innerHTML='<b style="color:var(--warn)">Ojo: '+v+' es una cantidad muy alta.</b> Si querías escribir un precio, este no es el campo — aquí va desde cuántas unidades aplica el mayoreo (normalmente entre 5 y 100).';
+    } else {
+      const u=(document.getElementById('p_uni')||{}).value||'unidad';
+      h.textContent='Aquí va una CANTIDAD, no un precio. Al vender '+(v||1)+' '+uniPlural(u)+' o más, la app cobra sola el precio al por mayor.';
+    }
+  },
   async saveProd(){
     const id=S.ctx.editId;
     const nombre=document.getElementById('p_nom').value.trim();
@@ -2352,7 +2496,7 @@ document.addEventListener('input',e=>{ if(e.target.id==='f_precio') e.target.dat
    3) Anti-retroceso de reloj: DB.licencia.maxDate.
    Acceso al panel oculto: toca el logo (login/bloqueo) o la marca de arriba
    5 veces y entra con el PIN de creador (DB.creatorPin, por defecto 2468). */
-const APP_VER = 'v13';
+const APP_VER = 'v17';
 const GRACIA_DIAS = 7;
 /* Cuenta de soporte del creador. No vive en DB.usuarios: el cliente no la ve,
    no la puede editar ni borrar, y sobrevive aunque cambie todas las claves.
@@ -2368,6 +2512,7 @@ async function huella(txt){
   }catch(e){ return ''; }
 }
 let _revLocal = 0;
+let _fsRef = null;
 function sumarDias(fechaISO,n){
   const b=(fechaISO||today()).split('-');
   const d=new Date(+b[0],+b[1]-1,+b[2]); d.setDate(d.getDate()+n);
