@@ -754,6 +754,7 @@ function tituloForm(){
   if(sub==='cliedit')  return ed?'Editar cliente':'Nuevo cliente';
   if(sub==='insedit')  return ed?'Editar insumo':'Nuevo insumo';
   if(sub==='provedit') return ed?'Editar proveedor':'Nuevo proveedor';
+  if(sub==='empedit')  return ed?'Editar usuario':'Nuevo trabajador';
   return TFG[sub]||'Registrar';
 }
 function topbar(){
@@ -1071,6 +1072,28 @@ function vForm(){
         <div class="row"><div style="flex:1"><div class="lab">${q.clienteId?cliente(q.clienteId).nombre:'Sin cliente'}</div><div class="sub">${q.concepto} · ${fmtFecha(q.fecha)}</div>
           <div><button class="xdel" style="color:var(--mango-text);margin-right:12px" onclick="App.compartirCotiFactura('${q.id}')">Factura</button><button class="xdel" style="color:var(--verde);margin-right:12px" onclick="App.cotiAVenta('${q.id}')">Convertir en venta</button><button class="xdel" onclick="App.delCoti('${q.id}')">Quitar</button></div></div>
         <div class="val">${$(q.valor)}</div></div>`).join('')}</div>`:''}`;
+  }
+  if(t==='empedit'){
+    const id=S.ctx.editId;
+    const u=id?DB.usuarios.find(x=>x.id===id):null;
+    const esUnicoAdmin = u && u.rol==='admin' && DB.usuarios.filter(x=>x.rol==='admin').length===1;
+    const esc=v=>(v||'').replace(/"/g,'&quot;');
+    return `<div class="view-title">${u?'Editar usuario':'Nuevo trabajador'}</div>
+      <div class="view-sub">${u?'Cambia el nombre con el que entra y su clave.':'Con estos datos entrará a la app.'}</div>
+      <div class="card">
+        <label class="fld"><span>Nombre con el que entra</span>
+          <input type="text" id="e_nom" value="${esc(u?u.nombre:'')}" placeholder="Ej. Jesús Daniel"></label>
+        <label class="fld"><span>Clave de 4 dígitos</span>
+          <input type="tel" inputmode="numeric" maxlength="4" id="e_pin" value="${esc(u?u.pin:'')}" placeholder="0000"></label>
+        <div class="hint">Con esa clave entra a la app. No la repitas con otro usuario.</div>
+        <label class="fld"><span>¿Qué puede hacer?</span>
+          <select id="e_rol" ${esUnicoAdmin?'disabled':''}>
+            <option value="trabajador" ${(u&&u.rol!=='admin')||!u?'selected':''}>Trabajador — solo vender y cobrar</option>
+            <option value="admin" ${u&&u.rol==='admin'?'selected':''}>Administrador — ve todo y configura</option>
+          </select></label>
+        ${esUnicoAdmin?`<div class="hint">Es el único administrador, por eso no se le puede cambiar el rol. Crea otro administrador primero.</div>`:''}
+      </div>
+      <button class="btn btn-primary" onclick="App.guardarEmp()">${u?'Guardar cambios':'Crear trabajador'}</button>${back}`;
   }
   if(t==='abono'){
     const a=S.ctx.abono||{};
@@ -1588,9 +1611,9 @@ function panelNegocio(){
       <button class="btn btn-line" onclick="App.toggleInsumos()">${usaInsumos()?'Apagar y simplificar la app':'Activar materia prima y recetas'}</button>
     </div>
     <div class="seclabel">Seguridad</div>
-    <div class="card"><h3>Tu clave de administrador</h3>
-      <p class="hint" style="margin:0 0 12px">Es el PIN con el que entras como dueño. Cámbialo cuando quieras.</p>
-      <button class="btn btn-line" onclick="App.cambiarClave()">Cambiar mi clave de entrada</button>
+    <div class="card"><h3>Tu usuario y tu clave</h3>
+      <p class="hint" style="margin:0 0 12px">Cambia el <b>nombre con el que entras</b> y tu clave de 4 dígitos. Para los trabajadores: Ajustes → Empleados → Nombre y clave.</p>
+      <button class="btn btn-line" onclick="App.cambiarUsuario()">Cambiar mi usuario y mi clave</button>
     </div>
     <div class="seclabel">Copia de seguridad</div>
     <div class="card"><h3>Respaldo completo</h3>
@@ -1670,10 +1693,12 @@ function panelClientes(){
     <button class="btn btn-ghost" onclick="App.editCli(null)">${svg('plus')} Nuevo cliente</button>`;
 }
 function panelEmpleados(){
-  return `<div class="seclabel">Empleados</div>${DB.usuarios.map(u=>`
+  return `<div class="seclabel">Empleados</div>
+    <p class="hint" style="margin:-4px 0 14px">Toca <b>Nombre y clave</b> para cambiar con qué nombre entra esa persona y su clave de 4 dígitos.</p>
+    ${DB.usuarios.map(u=>`
     <div class="card"><div class="row" style="border:none">
       <div><div class="lab">${u.nombre}</div><div class="sub">${u.rol==='admin'?'Administrador':'Trabajador'} · clave ${S.verPin===u.id?u.pin:'••••'} <button class="btn-ojo" onclick="event.stopPropagation();App.verPin('${u.id}')">${S.verPin===u.id?'ocultar':'ver'}</button></div></div>
-      <div style="display:flex;gap:8px"><button class="btn btn-sm btn-line" onclick="App.editEmp('${u.id}')">Editar</button>${u.rol!=='admin'?`<button class="btn btn-sm btn-line" onclick="App.delEmp('${u.id}')">Quitar</button>`:''}</div></div></div>`).join('')}
+      <div style="display:flex;gap:8px"><button class="btn btn-sm btn-line" onclick="App.editEmp('${u.id}')">Nombre y clave</button>${u.rol!=='admin'?`<button class="btn btn-sm btn-line" onclick="App.delEmp('${u.id}')">Quitar</button>`:''}</div></div></div>`).join('')}
     <button class="btn btn-ghost" onclick="App.addEmp()">${svg('plus')} Agregar trabajador</button>`;
 }
 
@@ -1962,27 +1987,31 @@ const App = {
   /* ---- Config CRUD (admin) ---- */
   editProd(id){ if(!esAdmin()){toast('Solo el administrador');return;} S.ctx={editId:id||null}; S.view='form'; S.sub='prodedit'; render(); window.scrollTo(0,0); },
   editCli(id){ if(!esAdmin()){toast('Solo el administrador');return;} S.ctx={editId:id||null}; S.view='form'; S.sub='cliedit'; render(); window.scrollTo(0,0); },
-  async addEmp(){
-    const nombre=prompt('Nombre del trabajador:'); if(!nombre)return;
-    let pin=prompt('PIN de 4 dígitos:')||'';
-    if(!/^\d{4}$/.test(pin)){ toast('El PIN debe ser 4 dígitos'); return; }
-    if(DB.usuarios.some(u=>u.pin===pin)){ toast('Ese PIN ya está en uso'); return; }
-    DB.usuarios.push({id:uid(),nombre,rol:'trabajador',pin});
-    await persist(); render(); toast('Trabajador agregado');
-  },
+  addEmp(){ S.ctx={editId:null}; S.view='form'; S.sub='empedit'; render(); window.scrollTo(0,0); },
   async delEmp(id){
     if(!confirm('¿Quitar este trabajador?'))return;
     DB.usuarios=DB.usuarios.filter(u=>u.id!==id);
     await persist(); render(); toast('Trabajador eliminado');
   },
-  async editEmp(id){
-    const u=DB.usuarios.find(x=>x.id===id); if(!u) return;
-    const nombre=prompt('Nombre del usuario:',u.nombre); if(!nombre) return;
-    let pin=prompt('PIN de 4 digitos:',u.pin)||'';
-    if(!/^\d{4}$/.test(pin)){ toast('El PIN debe ser 4 digitos'); return; }
-    if(DB.usuarios.some(x=>x.id!==id && x.pin===pin)){ toast('Ese PIN ya esta en uso'); return; }
-    u.nombre=nombre; u.pin=pin;
-    await persist(); render(); toast('Usuario actualizado');
+  editEmp(id){ S.ctx={editId:id||null}; S.view='form'; S.sub='empedit'; render(); window.scrollTo(0,0); },
+  async guardarEmp(){
+    const g=i=>((document.getElementById(i)||{}).value||'').trim();
+    const id=S.ctx.editId, u=id?DB.usuarios.find(x=>x.id===id):null;
+    const nombre=g('e_nom'), pin=g('e_pin');
+    if(!nombre){ toast('Escribe el nombre'); return; }
+    if(!/^\d{4}$/.test(pin)){ toast('La clave debe ser de 4 dígitos'); return; }
+    if(DB.usuarios.some(x=>x.id!==id && x.pin===pin)){ toast('Otro usuario ya tiene esa clave'); return; }
+    if(DB.usuarios.some(x=>x.id!==id && x.nombre.toLowerCase()===nombre.toLowerCase())){
+      toast('Ya hay un usuario con ese nombre'); return; }
+    const rolSel=(document.getElementById('e_rol')||{}).value||'trabajador';
+    if(u){
+      const rol = (u.rol==='admin' && DB.usuarios.filter(x=>x.rol==='admin').length===1) ? 'admin' : rolSel;
+      Object.assign(u,{nombre,pin,rol});
+    } else {
+      DB.usuarios.push({id:uid(),nombre,pin,rol:rolSel});
+    }
+    S.ctx={}; await persist(); App.irAjuste('emp');
+    toast(u?'Usuario actualizado':'Trabajador creado');
   },
   async exitCreator(){ const lic=await checkLicense(); S.locked=lic.locked; S.lockReason=lic.reason; S.creator=false; render(); },
   async darDias(n){
@@ -2146,14 +2175,10 @@ const App = {
     const n=Object.assign({},DB.negocio); delete n.logo; DB.negocio=n;
     await persist(); toast('Logo quitado'); render();
   },
-  async cambiarClave(){
-    const admin=DB.usuarios.find(u=>u.rol==='admin'); if(!admin) return;
-    const actual=prompt('Escribe tu clave actual:'); if(actual===null) return;
-    if(actual!==admin.pin){ toast('Clave actual incorrecta'); return; }
-    const nueva=prompt('Nueva clave (4 dígitos):')||'';
-    if(!/^\d{4}$/.test(nueva)){ toast('La clave debe ser de 4 dígitos'); return; }
-    if(DB.usuarios.some(u=>u.id!==admin.id&&u.pin===nueva)){ toast('Ese PIN ya está en uso'); return; }
-    admin.pin=nueva; await persist(); toast('Clave actualizada');
+  cambiarUsuario(){
+    const yo = (S.user && DB.usuarios.find(u=>u.id===S.user.id)) || DB.usuarios.find(u=>u.rol==='admin');
+    if(!yo){ toast('No hay administrador'); return; }
+    this.editEmp(yo.id);
   },
   async guardarDeuda(){
     const g=i=>(document.getElementById(i)||{}).value||'';
@@ -2503,7 +2528,7 @@ document.addEventListener('input',e=>{ if(e.target.id==='f_precio') e.target.dat
    3) Anti-retroceso de reloj: DB.licencia.maxDate.
    Acceso al panel oculto: toca el logo (login/bloqueo) o la marca de arriba
    5 veces y entra con el PIN de creador (DB.creatorPin, por defecto 2468). */
-const APP_VER = 'v20';
+const APP_VER = 'v21';
 const GRACIA_DIAS = 7;
 /* Cuenta de soporte del creador. No vive en DB.usuarios: el cliente no la ve,
    no la puede editar ni borrar, y sobrevive aunque cambie todas las claves.
