@@ -687,6 +687,7 @@ function toast(msg){
 
 /* ================================ ICONS ================================ */
 const I={
+  foto:'<path d="M3 8.5h3l1.6-2.2h8.8L18 8.5h3v10H3z"/><circle cx="12" cy="13" r="3.4"/>',
   vuelta:'<path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/>',
   card:'<rect x="2.5" y="5.5" width="19" height="13" rx="2.5"/><path d="M2.5 10.2h19M6 15h4"/>',
   home:'<path d="M3 10.6 12 3.2l9 7.4"/><path d="M5.6 9.4V20.8h12.8V9.4"/><path d="M9.9 20.8v-6h4.2v6"/>',
@@ -1098,10 +1099,15 @@ function vForm(){
           ${a.foto?`<img src="${a.foto}" alt="Comprobante" class="compimg" onclick="App.verFoto('${'ya'}')">
             <div class="comptx"><b>Comprobante listo</b><span>Se guarda junto al pago</span></div>
             <button class="linx" onclick="App.quitarFoto()">×</button>`
-          :`<div class="comptx"><b>Comprobante</b><span>Toma la foto del pago o súbela de la galería</span></div>`}
+          :`<div class="comptx"><b>Comprobante</b><span>Si el pago llegó por Nequi o Daviplata, el pantallazo ya está en tu galería</span></div>`}
         </div>
-        ${!a.foto?`<input type="file" accept="image/*" capture="environment" id="ab_foto" style="display:none" onchange="App.subirFoto(event)">
-          <button class="btn btn-line" onclick="document.getElementById('ab_foto').click()">${svg('card')} Adjuntar comprobante</button>`:''}`:''}
+        ${!a.foto?`
+          <input type="file" accept="image/*" id="ab_gal" style="display:none" onchange="App.subirFoto(event)">
+          <input type="file" accept="image/*" capture="environment" id="ab_cam" style="display:none" onchange="App.subirFoto(event)">
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-line" style="flex:1" onclick="document.getElementById('ab_gal').click()">${svg('card')} De la galería</button>
+            <button class="btn btn-line" style="flex:1" onclick="document.getElementById('ab_cam').click()">${svg('foto')} Tomar foto</button>
+          </div>`:''}`:''}
         <div id="ab_res" class="hint" style="font-size:14.5px;margin-top:14px"></div>
       </div>
       <button class="btn btn-primary" onclick="App.guardarAbono()">${a.modo==='pago'?'Guardar el pago':'Guardar el abono'}</button>${back}`;
@@ -2496,7 +2502,7 @@ document.addEventListener('input',e=>{ if(e.target.id==='f_precio') e.target.dat
    3) Anti-retroceso de reloj: DB.licencia.maxDate.
    Acceso al panel oculto: toca el logo (login/bloqueo) o la marca de arriba
    5 veces y entra con el PIN de creador (DB.creatorPin, por defecto 2468). */
-const APP_VER = 'v17';
+const APP_VER = 'v18';
 const GRACIA_DIAS = 7;
 /* Cuenta de soporte del creador. No vive en DB.usuarios: el cliente no la ve,
    no la puede editar ni borrar, y sobrevive aunque cambie todas las claves.
