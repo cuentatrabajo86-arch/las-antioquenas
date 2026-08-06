@@ -639,6 +639,7 @@ function seed(){
     negocio:{nombre:'NEXBIT',sub:'Punto de venta y contabilidad',tel:'',nit:'',configurado:false,usaInsumos:true,email:'',direccion:''},
     deudas:[],
     retornos:[],        // producto que el cliente devolvió y aún no se le ha descontado
+    pagos:[],           // archivo de cada cobro: qué deudas cubrió, qué se devolvió, cuánto entró
     papelera:[],
     licencia:{activo:true,vence:null,url:'',lastCheck:0,maxDate:''},
     creatorPin:'2468',
@@ -760,7 +761,7 @@ function tituloForm(){
   return TFG[sub]||'Registrar';
 }
 function topbar(){
-  const T={inicio:'Inicio',registrar:'Registrar',buscar:'Balance',cobros:'Te deben',deudas:'Tú debes',ajustes:'Ajustes',informe:'Informe del día',form:'Registrar'};
+  const T={inicio:'Inicio',registrar:'Registrar',buscar:'Balance',cobros:'Te deben',deudas:'Tú debes',pagos:'Historial de pagos',ajustes:'Ajustes',informe:'Informe del día',form:'Registrar'};
 
   return `<div class="topbar">
     <button class="burger" onclick="App.toggleDrawer()" aria-label="Abrir menú">${svg('menu')}</button>
@@ -784,6 +785,7 @@ function navbar(){
       ${it(S.view==='registrar'||S.view==='form','plus','Registrar',"App.irA('registrar')")}
       ${it(S.view==='buscar','chart','Balance',"App.irA('buscar')")}
       ${it(S.view==='cobros','money','Te deben',"App.irA('cobros')")}
+      ${it(S.view==='pagos','clock','Historial de pagos',"App.irA('pagos')")}
       ${esAdmin()?it(S.view==='deudas','card','Tú debes',"App.irA('deudas')"):''}
       ${esAdmin()?`
       <div class="dgrp">Catálogos</div>
@@ -811,6 +813,7 @@ function viewRouter(){
     case 'buscar': return vBalance();
     case 'cobros': return vCobros();
     case 'deudas': return vDeudas();
+    case 'pagos': return vPagos();
     case 'ajustes': return vAjustes();
     case 'informe': return vInforme();
     case 'form': return vForm();
@@ -1120,8 +1123,20 @@ function vForm(){
           <label class="fld" style="flex:1"><span>Precio que pagó</span><input type="number" min="0" inputmode="numeric" id="r_precio" value="${tmp.precio||''}" oninput="this.dataset.touched=1;App.retornoCalc()"></label>
         </div>
         <label class="fld"><span>¿Qué día?</span><input type="date" id="r_fecha" value="${tmp.fecha||today()}"></label>
+        <button class="btn btn-line" onclick="App.agregarRetorno()">＋ Agregar a la devolución</button>
+        <div style="height:14px"></div>
         <div id="r_tot" class="hint" style="font-size:15px;font-weight:800;color:var(--ink)"></div>
       </div>
+      ${(S.ctx.retorno&&(S.ctx.retorno.carrito||[]).length)?`<div class="card">
+        <h3>En esta devolución</h3>
+        <div class="lincard">${S.ctx.retorno.carrito.map((l,k)=>`<div class="linrow">
+          <div class="lintx"><b>${l.qty} × ${prod(l.prodId).nombre}</b><span>${$(l.precio)} c/u · ${fmtFecha(l.fecha)}</span></div>
+          <div class="linval">${$(l.qty*l.precio)}</div>
+          <button class="linx" onclick="App.quitarLineaRetorno(${k})" aria-label="Quitar">×</button>
+        </div>`).join('')}</div>
+        <div class="row" style="border-bottom:none"><div class="lab">Total a descontar</div>
+          <div class="val" style="color:var(--warn)">${$(S.ctx.retorno.carrito.reduce((t,l)=>t+l.qty*l.precio,0))}</div></div>
+      </div>`:''}
       ${pend.length?`<div class="card"><h3>Ya anotadas y sin descontar</h3>
         ${pend.map(r=>`<div class="row"><div><div class="sub">${fmtFecha(r.fecha)} · ${r.qty} × ${prod(r.prodId).nombre}</div></div>
           <div style="display:flex;gap:8px;align-items:center"><span class="val" style="color:var(--warn)">${$(valorRetorno(r))}</span>
@@ -1577,7 +1592,10 @@ function vCobros(){
       <div style="display:flex;gap:8px">
         <button class="btn btn-verde btn-sm" style="flex:1" onclick="App.reciboAbono()">Enviar recibo</button>
         <button class="btn btn-ghost btn-sm" style="width:auto" onclick="App.cerrarAviso()">Listo</button>
-      </div></div>`:''}
+      </div>
+      <div style="height:8px"></div>
+      <button class="btn btn-line btn-sm" onclick="App.cerrarAviso();App.irA('pagos')">Ver en el historial</button>
+      </div>`:''}
     ${aFavor.length? aFavor.map(cid=>`<div class="card">
       <div class="row" style="border:none;padding:0 0 10px">
         <div><div class="lab">${cliente(cid).nombre}</div>
@@ -1646,6 +1664,52 @@ const saldoDeuda = d => Math.max(0, d.monto - (d.abonos||[]).reduce((s,a)=>s+mon
 const saldoDeudasTotal = () => (DB.deudas||[]).filter(d=>d.estado!=='pagada').reduce((t,d)=>t+saldoDeuda(d),0);
 
 /* -------------------------------- AJUSTES -------------------------------- */
+function vPagos(){
+  const q=(S.ctx.q||'').trim().toLowerCase();
+  const todos=(DB.pagos||[]);
+  const lista = q ? todos.filter(p=>((p.cliente||'')+' '+(p.recibo||'')+' '+fmtFecha(p.fecha)).toLowerCase().includes(q)) : todos;
+  const totalPlata=lista.reduce((t,p)=>t+(p.plata||0),0);
+  const totalDev=lista.reduce((t,p)=>t+(p.devuelto||0),0);
+
+  const tarjeta=p=>`<div class="card">
+    <div class="row" style="border:none;padding:0 0 10px">
+      <div style="min-width:0"><div class="lab">${p.cliente||'—'}</div>
+      <div class="sub">${fmtFecha(p.fecha)}${fmtHora(p.ts)?' · '+fmtHora(p.ts):''} · ${p.recibo||''}${p.usuario?' · lo recibió '+p.usuario:''}</div></div>
+      <div class="val" style="color:var(--verde);font-size:17px">${$(p.plata)}</div>
+    </div>
+    ${p.devuelto>0?`<div class="row" style="border:none;padding:0 0 8px">
+      <div><div class="sub" style="color:var(--warn);font-weight:800">Le descontaste ${$(p.devuelto)} en producto devuelto</div></div></div>
+      <div class="lincard" style="margin-bottom:12px">${(p.devoluciones||[]).map(d=>`<div class="linrow">
+        <div class="lintx"><b>${d.qty} × ${d.nombre}</b><span>${$(d.precio)} c/u · ${fmtFecha(d.fecha)}</span></div>
+        <div class="linval" style="color:var(--warn)">${$(d.valor)}</div></div>`).join('')}</div>`:''}
+    <div class="seclabel" style="margin:0 0 6px">Deudas que cubrió</div>
+    ${(p.fiados||[]).map(f=>`<div class="row"><div style="min-width:0">
+      <div class="sub">${fmtFecha(f.fecha)} · ${(f.detalle||'Venta').slice(0,40)}</div>
+      ${f.via?`<div class="sub" style="font-size:11px;color:${f.via==='devuelto'?'var(--warn)':'var(--verde)'}">cubierto con ${f.via==='devuelto'?'producto devuelto':'plata'}</div>`:''}</div>
+      <div class="val" style="color:${f.via==='devuelto'?'var(--warn)':'var(--ink)'}">${$(f.parte)}</div></div>`).join('') || '<div class="sub">Sin detalle</div>'}
+    <div class="row" style="border-bottom:none;padding-top:12px">
+      <div><div class="lab">Cubrió en total</div>
+      <div class="sub">${$(p.plata)} en plata${p.devuelto>0?' + '+$(p.devuelto)+' en producto':''}</div></div>
+      <div class="val" style="font-size:16px">${$(p.cubierto)}</div></div>
+    <div class="row" style="border-bottom:none;padding-top:0">
+      <div class="sub">${p.saldoDespues>0?'Le quedó debiendo':'Quedó a paz y salvo'}</div>
+      <div class="val" style="color:${p.saldoDespues>0?'var(--warn)':'var(--verde)'}">${$(p.saldoDespues)}</div></div>
+    ${p.comprobante?`<button class="btn btn-line btn-sm" onclick="App.verFoto('${p.comprobante}')">Ver comprobante</button>`:''}
+  </div>`;
+
+  return `<div class="view-title">Historial de pagos</div>
+    <div class="view-sub">${todos.length? `${todos.length} cobro${todos.length===1?'':'s'} guardado${todos.length===1?'':'s'}`:'Aquí queda cada cobro que registres.'}</div>
+    ${todos.length?`<div class="statgrid">
+      <div class="stat"><b>${$(totalPlata)}</b><span>Cobrado en plata</span></div>
+      <div class="stat"><b>${$(totalDev)}</b><span>Descontado en producto</span></div>
+    </div>
+    <div class="card" style="padding:14px 16px">
+      <label class="fld" style="margin:0"><span>Buscar por cliente, recibo o fecha</span>
+        <input type="text" id="b_q" value="${q.replace(/"/g,'&quot;')}" placeholder="Ej. Jorge, A-0001" oninput="App.buscarVivo(this.value)"></label>
+    </div>
+    ${lista.length? lista.map(tarjeta).join('') : `<div class="empty">${svg('empty')}<div>Nada con esa búsqueda.</div></div>`}`
+    : `<div class="empty">${svg('clock')}<div>Todavía no has registrado ningún cobro.</div></div>`}`;
+}
 function vDeudas(){
   if(!esAdmin()) return `<div class="empty">${svg('lock')}<div>Esta sección es del administrador.</div></div>`;
   const abiertas=(DB.deudas||[]).filter(d=>d.estado!=='pagada');
@@ -1913,7 +1977,7 @@ const App = {
     const ab=d.classList.toggle('abierto'); if(b) b.classList.toggle('on',ab); },
   closeDrawer(){ const d=document.getElementById('drawer'),b=document.getElementById('dbackdrop');
     if(d) d.classList.remove('abierto'); if(b) b.classList.remove('on'); },
-  irA(v){ this.closeDrawer(); this.go(v); },
+  irA(v){ this.closeDrawer(); if(v!=='cobros') S.ctx.ultimoAbono=null; this.go(v); },
   nuevaVenta(){ this.closeDrawer(); this.form('venta'); },
   irAjuste(k){ this.closeDrawer(); S.view='ajustes'; S.sub=k; S.ctx={}; render(); window.scrollTo(0,0); },
   sub(s){ S.sub=s; render(); window.scrollTo(0,0); },
@@ -2007,23 +2071,41 @@ const App = {
     const qty=parseInt((g('r_qty')||{}).value)||0;
     const pr=g('r_precio');
     const cid=(S.ctx.retorno||{}).clienteId||'';
-    if(pr && (recalcular || !pr.dataset.touched) && pid) pr.value=precioQuePago(cid,pid);
+    if(pr && (recalcular || !pr.dataset.touched || !pr.value) && pid) pr.value=precioQuePago(cid,pid);
     const precio=parseInt((pr||{}).value)||0;
     const t=g('r_tot');
     if(t) t.innerHTML=`Se le descuenta: ${$(qty*precio)}`
       + `<div class="sub" style="font-weight:600;margin-top:4px">${qty} × ${pid?prod(pid).nombre:''} al precio que te pagó</div>`;
   },
-  async guardarRetorno(){
+  leerLineaRetorno(){
     const g=i=>(document.getElementById(i)||{}).value||'';
-    const cid=(S.ctx.retorno||{}).clienteId||'';
     const prodId=g('r_prod'), qty=parseInt(g('r_qty'))||0, precio=parseInt(g('r_precio'))||0;
-    if(!prodId||qty<1){ toast('Escoge el producto y la cantidad'); return; }
-    if(precio<1){ toast('Escribe el precio que te pagó'); return; }
-    DB.retornos.push({id:uid(),clienteId:cid,prodId,qty,precio,fecha:g('r_fecha')||today(),
-      ts:Date.now(),aplicado:false,usuario:S.user?S.user.nombre:''});
+    if(!prodId||qty<1||precio<1) return null;
+    return {prodId, qty, precio, fecha:g('r_fecha')||today()};
+  },
+  agregarRetorno(){
+    const l=this.leerLineaRetorno();
+    if(!l){ toast('Escoge el producto, la cantidad y el precio'); return; }
+    const r=S.ctx.retorno||{};
+    r.carrito=[...(r.carrito||[]), l];
+    r.prodId=''; r.qty=1; r.precio='';
+    S.ctx.retorno=r; render();
+  },
+  quitarLineaRetorno(k){
+    const r=S.ctx.retorno||{}; (r.carrito||[]).splice(k,1); S.ctx.retorno=r; render();
+  },
+  async guardarRetorno(){
+    const cid=(S.ctx.retorno||{}).clienteId||'';
+    const carrito=[...((S.ctx.retorno||{}).carrito||[])];
+    const pend=this.leerLineaRetorno();
+    if(pend) carrito.push(pend);
+    if(!carrito.length){ toast('Agrega al menos un producto'); return; }
+    carrito.forEach(l=>DB.retornos.push({id:uid(),clienteId:cid,prodId:l.prodId,qty:l.qty,
+      precio:l.precio,fecha:l.fecha,ts:Date.now(),aplicado:false,usuario:S.user?S.user.nombre:''}));
+    const total=carrito.reduce((t,l)=>t+l.qty*l.precio,0);
     await persist();
     S.ctx={retorno:{clienteId:cid}}; render();
-    toast('Anotado — se le descuenta cuando te pague');
+    toast(`${carrito.length} producto${carrito.length===1?'':'s'} anotado${carrito.length===1?'':'s'} · ${$(total)} se le descuenta cuando pague`);
   },
   async borrarRetorno(id){
     const r=(DB.retornos||[]).find(x=>x.id===id); if(!r) return;
@@ -2119,6 +2201,14 @@ const App = {
       d.abonos=d.abonos||[];
       d.abonos.push(Object.assign({id:uid(),monto},base));
       if(saldoDeuda(d)<1) d.estado='pagada';
+      DB.pagos.unshift({id:uid(), recibo:'', clienteId:'', cliente:d.acreedor,
+        tipo:'pago-propio', fecha:base.fecha, ts:base.ts, usuario:base.usuario,
+        metodo:a.metodo, referencia, comprobante,
+        plata:monto, devuelto:0, cubierto:monto,
+        deudaAntes:a.deuda, saldoDespues:saldoDeuda(d),
+        fiados:[{fecha:d.fecha, detalle:'Le pagaste · '+(d.concepto||'deuda'), parte:monto, quedo:saldoDeuda(d)}],
+        devoluciones:[]});
+      DB.pagos=DB.pagos.slice(0,400);
       S.ctx={}; await persist(); App.irA('deudas');
       toast(d.estado==='pagada'?'¡Deuda saldada!':'Pago anotado — debes '+$(saldoDeuda(d)));
       return;
@@ -2157,6 +2247,25 @@ const App = {
     }
     const restante=DB.fiados.filter(f=>f.clienteId===a.cid && f.estado!=='pagado')
       .reduce((t,f)=>t+saldoFiado(f),0);
+
+    /* ARCHIVO DEL COBRO: se guarda todo lo necesario para reconstruirlo después,
+       aunque más adelante se limpien los fiados ya pagados. */
+    const devDetalle = pend.map(r=>({prodId:r.prodId, nombre:prod(r.prodId).nombre,
+        qty:r.qty, precio:r.precio, valor:valorRetorno(r), fecha:r.fecha}));
+    if(rq.parcial) devDetalle.push({prodId:rq.parcial.r.prodId, nombre:prod(rq.parcial.r.prodId).nombre,
+        qty:rq.parcial.qty, precio:rq.parcial.r.precio, valor:rq.parcial.valor, fecha:rq.parcial.r.fecha});
+    DB.pagos.unshift({
+      id:uid(), recibo, clienteId:a.cid, cliente:cliente(a.cid).nombre,
+      fecha:base.fecha, ts:base.ts, usuario:base.usuario,
+      metodo:a.metodo, referencia, comprobante,
+      plata:monto, devuelto:descuento, cubierto:monto+descuento,
+      deudaAntes:a.deuda, saldoDespues:restante,
+      fiados:[...aplicadoRet.map(x=>({fecha:x.fecha, detalle:x.detalle, parte:x.parte, quedo:x.quedo, via:'devuelto'})),
+              ...aplicado.map(x=>({fecha:x.fecha, detalle:x.detalle, parte:x.parte, quedo:x.quedo, via:'plata'}))],
+      devoluciones:devDetalle
+    });
+    DB.pagos=DB.pagos.slice(0,400);
+
     S.ctx={ultimoAbono:{cid:a.cid, monto, descuento, recibo, metodo:a.metodo, referencia,
       fecha:base.fecha, ts:base.ts, aplicado:[...aplicadoRet,...aplicado], restante}};
     await persist(); App.irA('cobros');
@@ -2250,7 +2359,7 @@ const App = {
     if(!esAdmin()){ toast('Solo el administrador'); return; }
     /* Blindaje explicito: estas llaves NO se tocan jamas en este reset. */
     const PROTEGIDAS=['productos','clientes','usuarios','insumos','proveedores','negocio','licencia','creatorPin'];
-    const OPERATIVAS=['dias','fiados','compras','cotizaciones','deudas','papelera','retornos'];
+    const OPERATIVAS=['dias','fiados','compras','cotizaciones','deudas','papelera','retornos','pagos'];
     const antes={}; PROTEGIDAS.forEach(k=>antes[k]=JSON.stringify(DB[k]));
     const mov=(DB.dias||[]).reduce((t,d)=>t+d.mayoreo.length+(d.libres||[]).length+d.gastos.length+d.mermas.length+(d.devoluciones||[]).length,0);
     if(!mov && !(DB.fiados||[]).length){ toast('Ya está limpio, no hay movimientos'); return; }
@@ -2723,7 +2832,7 @@ document.addEventListener('input',e=>{ if(e.target.id==='f_precio') e.target.dat
    3) Anti-retroceso de reloj: DB.licencia.maxDate.
    Acceso al panel oculto: toca el logo (login/bloqueo) o la marca de arriba
    5 veces y entra con el PIN de creador (DB.creatorPin, por defecto 2468). */
-const APP_VER = 'v23';
+const APP_VER = 'v24';
 const GRACIA_DIAS = 7;
 /* Cuenta de soporte del creador. No vive en DB.usuarios: el cliente no la ve,
    no la puede editar ni borrar, y sobrevive aunque cambie todas las claves.
@@ -2873,6 +2982,7 @@ function sanea(){
   DB.deudas=DB.deudas||[];
   DB.papelera=DB.papelera||[];
   DB.retornos=DB.retornos||[];
+  DB.pagos=DB.pagos||[];
   // ---- Migración al libro por fechas (corre una sola vez) ----
   if(!DB.dias){
     DB.dias=[];
