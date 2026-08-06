@@ -520,6 +520,7 @@ function movimientos(desde,hasta){
   const _pagos={};
   (DB.fiados||[]).forEach(f=>{
     (f.abonos||[]).forEach(a=>{
+      if(a && a.esRetorno) return;      /* devolución de producto: no es plata */
       const monto=montoAbono(a); if(monto<=0) return;
       const fecha=(a && a.fecha) || f.fecha;
       if(fecha<desde||fecha>hasta) return;
@@ -637,6 +638,7 @@ function seed(){
     cotizaciones:[],      // {id,clienteId,concepto,valor,fecha,ts}
     negocio:{nombre:'NEXBIT',sub:'Punto de venta y contabilidad',tel:'',nit:'',configurado:false,usaInsumos:true,email:'',direccion:''},
     deudas:[],
+    retornos:[],        // producto que el cliente devolvió y aún no se le ha descontado
     papelera:[],
     licencia:{activo:true,vence:null,url:'',lastCheck:0,maxDate:''},
     creatorPin:'2468',
@@ -911,6 +913,9 @@ function vBalance(){
   const gan = _dd.reduce((t,x)=>t+(x.gananciaNeta||0),0);
   /* Cuánto de lo vendido en el periodo salió fiado: la ganancia lo incluye. */
   const ganFiado = _dd.reduce((t,x)=>t+(x.ingMayoreoFiado||0)+(x.ingLibresFiado||0),0);
+  /* Producto devuelto en el periodo: deshace venta, no es un gasto */
+  const devProd = (DB.retornos||[]).filter(r=>r.aplicado && r.aplicadoFecha>=desde && r.aplicadoFecha<=hasta)
+    .reduce((t,r)=>t+valorRetorno(r),0);
   /* Productos vendidos sin costo cargado inflan la ganancia. */
   const sinCosto = [...new Set((DB.dias||[]).filter(d=>d.fecha>=desde&&d.fecha<=hasta)
     .flatMap(d=>d.mayoreo.flatMap(m=>lineasVenta(m).map(l=>l.prodId).filter(Boolean))))]
@@ -958,8 +963,12 @@ function vBalance(){
       </div>
       <div class="row" style="border-top:1px solid var(--line);border-bottom:none;padding:14px 0 16px;margin:0">
         <div><div class="lab">Ganancia del periodo</div><div class="sub">Lo vendido menos el costo y los gastos</div></div>
-        <div class="val" style="color:${gan>=0?'var(--verde)':'var(--coral)'};font-size:17px">${$(gan)}</div>
+        <div class="val" style="color:${(gan-devProd)>=0?'var(--verde)':'var(--coral)'};font-size:17px">${$(gan-devProd)}</div>
       </div>
+      ${devProd>0?`<div class="row" style="border-bottom:none;padding:0 0 12px">
+        <div><div class="sub">Producto devuelto por clientes</div>
+        <div class="sub" style="font-size:11px">No es un gasto: se le descontó de lo que debían</div></div>
+        <div class="val" style="color:var(--warn)">&minus;${$(devProd)}</div></div>`:''}
       ${ganFiado>0?`<div class="sub" style="padding:0 0 12px;color:var(--warn)">Ojo: ${$(ganFiado)} de eso lo vendiste fiado, todavía no entra a caja.</div>`:''}
       ${sinCosto.length?`<div class="sub" style="padding:0 0 12px;color:var(--warn)">${sinCosto.length} producto${sinCosto.length===1?'':'s'} sin costo cargado (${sinCosto.slice(0,3).map(id=>prod(id).nombre).join(', ')}${sinCosto.length>3?'…':''}). La ganancia sale más alta de lo real.</div>`:''}
     </div>
@@ -1095,6 +1104,32 @@ function vForm(){
       </div>
       <button class="btn btn-primary" onclick="App.guardarEmp()">${u?'Guardar cambios':'Crear trabajador'}</button>${back}`;
   }
+  if(t==='retorno'){
+    const cid=(S.ctx.retorno&&S.ctx.retorno.clienteId)||'';
+    const tmp=S.ctx.retorno||{};
+    const activos=DB.productos.filter(p=>p.activo);
+    const pid=tmp.prodId||(activos[0]?activos[0].id:'');
+    const pend=retornosPend(cid);
+    return `<div class="view-title">Producto devuelto</div>
+      <div class="view-sub">Lo que ${cliente(cid).nombre} te devolvió dañado. Se le descuenta el día que te pague.</div>
+      <div class="card">
+        <label class="fld"><span>¿Qué producto te devolvió?</span>
+          <select id="r_prod" onchange="App.retornoCalc(1)">${activos.map(p=>`<option value="${p.id}" ${pid===p.id?'selected':''}>${p.nombre}</option>`).join('')}</select></label>
+        <div style="display:flex;gap:10px">
+          <label class="fld" style="flex:1"><span>¿Cuántas?</span><input type="number" min="1" inputmode="numeric" id="r_qty" value="${tmp.qty||1}" oninput="App.retornoCalc()"></label>
+          <label class="fld" style="flex:1"><span>Precio que pagó</span><input type="number" min="0" inputmode="numeric" id="r_precio" value="${tmp.precio||''}" oninput="this.dataset.touched=1;App.retornoCalc()"></label>
+        </div>
+        <label class="fld"><span>¿Qué día?</span><input type="date" id="r_fecha" value="${tmp.fecha||today()}"></label>
+        <div id="r_tot" class="hint" style="font-size:15px;font-weight:800;color:var(--ink)"></div>
+      </div>
+      ${pend.length?`<div class="card"><h3>Ya anotadas y sin descontar</h3>
+        ${pend.map(r=>`<div class="row"><div><div class="sub">${fmtFecha(r.fecha)} · ${r.qty} × ${prod(r.prodId).nombre}</div></div>
+          <div style="display:flex;gap:8px;align-items:center"><span class="val" style="color:var(--warn)">${$(valorRetorno(r))}</span>
+          <button class="btn btn-sm btn-ghost" style="width:auto" onclick="App.borrarRetorno('${r.id}')">Quitar</button></div></div>`).join('')}
+        <div class="row" style="border-bottom:none"><div class="lab">Total sin descontar</div><div class="val" style="color:var(--warn)">${$(valorRetornosPend(cid))}</div></div>
+      </div>`:''}
+      <button class="btn btn-primary" onclick="App.guardarRetorno()">Anotar la devolución</button>${back}`;
+  }
   if(t==='abono'){
     const a=S.ctx.abono||{};
     const quien = a.modo==='pago' ? ((DB.deudas.find(x=>x.id===a.did)||{}).acreedor||'') : cliente(a.cid).nombre;
@@ -1108,9 +1143,35 @@ function vForm(){
           <div class="sub">${a.modo==='cobro'&&!a.fid?'suma de todas sus deudas':'saldo pendiente'}</div></div>
           <div class="val" style="color:var(--coral);font-size:18px">${$(a.deuda||0)}</div>
         </div>
-        <label class="fld"><span>¿Cuánto ${a.modo==='pago'?'pagas':'abona'}?</span>
-          <input type="number" min="1" inputmode="numeric" id="ab_monto" value="${a.monto||''}" placeholder="0" oninput="App.abonoCalc()"></label>
-        <button class="btn btn-line btn-sm" onclick="App.abonoTodo()">Pagar todo (${$(a.deuda||0)})</button>
+        ${(()=>{ if(a.modo!=='cobro') return '';
+          const pend=retornosPend(a.cid), val=valorRetornosPend(a.cid);
+          if(!pend.length) return `<div class="hint" style="margin:-6px 0 14px">
+            ¿Te devolvió producto dañado? <button class="btn-ojo" onclick="App.anotarRetorno('${a.cid}')">anótalo aquí</button> y se le descuenta.</div>`;
+          const usar=a.usarRetornos!==false;
+          const rq=retornosQueCaben(a);
+          return `<div class="card" style="background:var(--warn-bg);border-color:var(--warn-line);margin:0 0 14px;padding:14px">
+            <div class="row" style="border:none;padding:0 0 8px">
+              <div><div class="lab" style="color:var(--warn)">Producto devuelto</div>
+              <div class="sub">${pend.length} ${pend.length===1?'anotación':'anotaciones'} sin descontar</div></div>
+              <div class="val" style="color:var(--warn)">&minus;${$(usar?rq.valor:val)}</div>
+            </div>
+            ${(usar&&rq.sobra>0)?`<div class="sub" style="color:var(--warn);font-weight:800;padding:0 0 8px">Solo caben ${$(rq.valor)} en esta cuenta. Le quedan ${$(rq.sobra)} a favor para la próxima.</div>`:''}
+            ${(usar&&rq.parcial)?`<div class="sub" style="padding:0 0 8px">De ${prod(rq.parcial.r.prodId).nombre} se le descuentan ${rq.parcial.qty} de ${rq.parcial.r.qty} ahora.</div>`:''}
+            ${pend.map(r=>`<div class="sub" style="padding:3px 0">${fmtFecha(r.fecha)} · ${r.qty} × ${prod(r.prodId).nombre} · ${$(valorRetorno(r))}</div>`).join('')}
+            <div style="height:10px"></div>
+            <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+              <input type="checkbox" id="ab_usaret" ${usar?'checked':''} onchange="App.toggleRetornos()" style="width:20px;height:20px">
+              <span style="font-size:13.5px;font-weight:800;color:var(--ink)">Descontarlas de esta cuenta</span></label>
+            <div style="height:10px"></div>
+            <button class="btn btn-line btn-sm" onclick="App.anotarRetorno('${a.cid}')">Anotar otra devolución</button>
+          </div>
+          ${usar?`<div class="row" style="border:none;padding:0 0 14px">
+            <div><div class="lab">Queda debiendo</div><div class="sub">después de descontar lo devuelto</div></div>
+            <div class="val" style="font-size:18px;color:var(--ink)">${$(Math.max(0,(a.deuda||0)-val))}</div></div>`:''}`;
+        })()}
+        <label class="fld"><span>¿Cuánto ${a.modo==='pago'?'pagas':'abona'} en plata?</span>
+          <input type="number" min="0" inputmode="numeric" id="ab_monto" value="${a.monto||''}" placeholder="0" oninput="App.abonoCalc()"></label>
+        <button class="btn btn-line btn-sm" onclick="App.abonoTodo()">Pagar todo (${$(topeAbono(a))})</button>
         <div style="height:16px"></div>
         <div class="seclabel" style="margin:0 0 10px">¿Cómo ${a.modo==='pago'?'pagaste':'te pagó'}?</div>
         <div class="mgrid">
@@ -1461,6 +1522,9 @@ function vCobros(){
   const total=abiertos.reduce((s,f)=>s+saldoFiado(f),0);
   const porCli={};
   abiertos.forEach(f=>{ (porCli[f.clienteId]=porCli[f.clienteId]||[]).push(f); });
+  /* Quien no debe nada pero tiene devoluciones a favor también tiene que verse */
+  const aFavor=[...new Set((DB.retornos||[]).filter(r=>!r.aplicado).map(r=>r.clienteId))]
+    .filter(cid=>!porCli[cid]);
   const ua=S.ctx.ultimoAbono;
 
   const bloques=Object.entries(porCli)
@@ -1483,7 +1547,12 @@ function vCobros(){
         </div>
         ${pagado>0?`<div class="dprog"><i style="width:${pct}%"></i></div>
         <div class="sub" style="margin-bottom:10px">Ha abonado ${$(pagado)} de ${$(original)} · ${pct}%</div>`:''}
+        ${(()=>{const v=valorRetornosPend(cid); return v>0?`<div class="row" style="border:none;padding:0 0 10px">
+          <div><div class="sub" style="color:var(--warn);font-weight:800">Te devolvió ${$(v)} en producto</div>
+          <div class="sub">se le descuenta cuando te pague</div></div></div>`:'';})()}
         <button class="btn btn-verde" onclick="App.cobrarCliente('${cid}')">Registrar un pago</button>
+        <div style="height:8px"></div>
+        <button class="btn btn-line btn-sm" onclick="App.anotarRetorno('${cid}')">Anotar producto devuelto</button>
         <div class="hint" style="margin:8px 0 12px">Se descuenta empezando por lo más viejo que te debe.</div>
         <div class="seclabel" style="margin:0 0 6px">Lo que te debe, venta por venta</div>
         ${orden.map(f=>{
@@ -1499,7 +1568,7 @@ function vCobros(){
     }).join('');
 
   return `<div class="view-title">Te deben</div>
-    <div class="view-sub">${abiertos.length? `${$(total)} sin cobrar en total`:'Nadie te debe. Todo al día.'}</div>
+    <div class="view-sub">${abiertos.length? `${$(total)} sin cobrar en total` : (aFavor.length?'Nadie te debe. Hay devoluciones a favor.':'Nadie te debe. Todo al día.')}</div>
     ${ua?`<div class="card" style="border-color:var(--verde)">
       <div class="row" style="border:none;padding:0 0 10px"><div>
         <div class="lab">Abono de ${cliente(ua.cid).nombre}</div>
@@ -1509,16 +1578,70 @@ function vCobros(){
         <button class="btn btn-verde btn-sm" style="flex:1" onclick="App.reciboAbono()">Enviar recibo</button>
         <button class="btn btn-ghost btn-sm" style="width:auto" onclick="App.cerrarAviso()">Listo</button>
       </div></div>`:''}
+    ${aFavor.length? aFavor.map(cid=>`<div class="card">
+      <div class="row" style="border:none;padding:0 0 10px">
+        <div><div class="lab">${cliente(cid).nombre}</div>
+        <div class="sub">No te debe nada</div></div>
+        <div class="val" style="color:var(--verde)">${$(0)}</div>
+      </div>
+      <div class="row" style="border:none;padding:0 0 10px">
+        <div><div class="sub" style="color:var(--warn);font-weight:800">Tiene ${$(valorRetornosPend(cid))} a favor en devoluciones</div>
+        <div class="sub">se le descuenta la próxima vez que te fíe</div></div>
+      </div>
+      <button class="btn btn-line btn-sm" onclick="App.anotarRetorno('${cid}')">Ver o anotar devoluciones</button>
+    </div>`).join(''):''}
     ${abiertos.length? `<div class="statgrid">
         <div class="stat neg"><b>${$(total)}</b><span>Te deben en total</span></div>
         <div class="stat"><b>${Object.keys(porCli).length}</b><span>${Object.keys(porCli).length===1?'Cliente te debe':'Clientes te deben'}</span></div>
       </div>${bloques}`
-      : `<div class="empty">${svg('money')}<div>No hay fiados pendientes.</div></div>`}`;
+      : (aFavor.length?'':`<div class="empty">${svg('money')}<div>No hay fiados pendientes.</div></div>`)}`;
 }
 
 const diasDesde = f => Math.floor((new Date(today())-new Date(f))/86400000);
 const montoAbono = a => (typeof a==='number') ? a : (a && a.monto) || 0;
 const saldoFiado = f => f.monto - (f.abonos||[]).reduce((s,a)=>s+montoAbono(a),0);
+/* Devoluciones anotadas y todavía no descontadas a ese cliente */
+const retornosPend = cid => (DB.retornos||[]).filter(r=>r.clienteId===cid && !r.aplicado);
+const valorRetorno = r => (r.qty||0)*(r.precio||0);
+const valorRetornosPend = cid => retornosPend(cid).reduce((t,r)=>t+valorRetorno(r),0);
+/* El precio a devolver es el que ESE cliente pagó, no el de lista */
+function precioQuePago(cid, prodId){
+  let mejor=null, cuando='';
+  (DB.dias||[]).forEach(d=>{
+    d.mayoreo.forEach(m=>{
+      if(m.clienteId!==cid) return;
+      lineasVenta(m).forEach(l=>{
+        if(l.prodId===prodId && (d.fecha>cuando)){ mejor=l.precio; cuando=d.fecha; }
+      });
+    });
+  });
+  if(mejor!=null) return mejor;
+  const p=prod(prodId); return p.menudeo||p.mayoreo||0;
+}
+/* Cuáles devoluciones caben en la deuda de hoy, de la más vieja a la más nueva.
+   Lo que no cabe NO se aplica: queda a favor del cliente para la próxima. */
+function retornosQueCaben(a){
+  if(!a || a.modo!=='cobro' || a.usarRetornos===false) return {caben:[], parcial:null, valor:0, sobra:0};
+  const orden=retornosPend(a.cid).slice()
+    .sort((x,y)=> x.fecha===y.fecha ? ((x.ts||0)-(y.ts||0)) : (x.fecha<y.fecha?-1:1));
+  let cupo=a.deuda||0, caben=[], valor=0, parcial=null;
+  for(const r of orden){
+    if(cupo<1) break;
+    const v=valorRetorno(r);
+    if(v<=cupo){ caben.push(r); valor+=v; cupo-=v; continue; }
+    /* No cabe entera: se aplica solo la parte que la deuda aguanta */
+    const q=Math.floor(cupo/(r.precio||1));
+    if(q>0){ parcial={r, qty:q, valor:q*r.precio}; valor+=q*r.precio; cupo-=q*r.precio; }
+    break;
+  }
+  const total=orden.reduce((t,r)=>t+valorRetorno(r),0);
+  return {caben, parcial, valor, sobra: total-valor};
+}
+/* Lo máximo que puede entrar en plata */
+function topeAbono(a){
+  if(!a) return 0;
+  return Math.max(0,(a.deuda||0)-retornosQueCaben(a).valor);
+}
 const saldoDeuda = d => Math.max(0, d.monto - (d.abonos||[]).reduce((s,a)=>s+montoAbono(a),0));
 const saldoDeudasTotal = () => (DB.deudas||[]).filter(d=>d.estado!=='pagada').reduce((t,d)=>t+saldoDeuda(d),0);
 
@@ -1866,17 +1989,54 @@ const App = {
   reciboAbono(){
     const a=S.ctx.ultimoAbono; if(!a) return;
     const lineas=a.aplicado.map(x=>[`${fechaCorta(x.fecha)} · ${(x.detalle||'Deuda').slice(0,26)}`, $(x.parte)]);
-    lineas.push(['—— Abono total ——', $(a.monto)]);
+    if(a.descuento>0) lineas.push(['Producto devuelto', '-'+$(a.descuento)]);
+    lineas.push(['—— Abono en plata ——', $(a.monto)]);
     lineas.push(['Le queda debiendo', $(a.restante)]);
     generarFactura({cliente:cliente(a.cid).nombre, telefono:(cliente(a.cid).contacto||''),
       lineas, total:a.monto, pago:a.metodo==='efectivo'?'Efectivo':'Transferencia',
       fecha:a.fecha, ts:a.ts, folio:a.recibo, ref:a.referencia, titulo:'RECIBO DE ABONO'});
   },
+  anotarRetorno(cid){
+    if(!DB.productos.filter(p=>p.activo).length){ toast('Primero crea tus productos'); return; }
+    S.ctx={retorno:{clienteId:cid}};
+    S.view='form'; S.sub='retorno'; render(); window.scrollTo(0,0);
+  },
+  retornoCalc(recalcular){
+    const g=i=>document.getElementById(i);
+    const pid=(g('r_prod')||{}).value||'';
+    const qty=parseInt((g('r_qty')||{}).value)||0;
+    const pr=g('r_precio');
+    const cid=(S.ctx.retorno||{}).clienteId||'';
+    if(pr && (recalcular || !pr.dataset.touched) && pid) pr.value=precioQuePago(cid,pid);
+    const precio=parseInt((pr||{}).value)||0;
+    const t=g('r_tot');
+    if(t) t.innerHTML=`Se le descuenta: ${$(qty*precio)}`
+      + `<div class="sub" style="font-weight:600;margin-top:4px">${qty} × ${pid?prod(pid).nombre:''} al precio que te pagó</div>`;
+  },
+  async guardarRetorno(){
+    const g=i=>(document.getElementById(i)||{}).value||'';
+    const cid=(S.ctx.retorno||{}).clienteId||'';
+    const prodId=g('r_prod'), qty=parseInt(g('r_qty'))||0, precio=parseInt(g('r_precio'))||0;
+    if(!prodId||qty<1){ toast('Escoge el producto y la cantidad'); return; }
+    if(precio<1){ toast('Escribe el precio que te pagó'); return; }
+    DB.retornos.push({id:uid(),clienteId:cid,prodId,qty,precio,fecha:g('r_fecha')||today(),
+      ts:Date.now(),aplicado:false,usuario:S.user?S.user.nombre:''});
+    await persist();
+    S.ctx={retorno:{clienteId:cid}}; render();
+    toast('Anotado — se le descuenta cuando te pague');
+  },
+  async borrarRetorno(id){
+    const r=(DB.retornos||[]).find(x=>x.id===id); if(!r) return;
+    if(r.aplicado){ toast('Esa ya se descontó, no se puede quitar'); return; }
+    if(!confirm('¿Quitar esta devolución?')) return;
+    DB.retornos=DB.retornos.filter(x=>x.id!==id);
+    await persist(); render(); toast('Quitada');
+  },
   cobrarCliente(cid){
     const ab=DB.fiados.filter(f=>f.clienteId===cid && f.estado!=='pagado');
     const deuda=ab.reduce((t,f)=>t+saldoFiado(f),0);
     if(deuda<1){ toast('Ese cliente no debe nada'); return; }
-    S.ctx={abono:{modo:'cobro', cid, deuda, metodo:'efectivo'}};
+    S.ctx={abono:{modo:'cobro', cid, deuda, metodo:'efectivo', usarRetornos:true}};
     S.view='form'; S.sub='abono'; render(); window.scrollTo(0,0);
   },
   cobrarFiado(fid){
@@ -1893,16 +2053,27 @@ const App = {
     S.ctx={abono:{modo:'pago', did, deuda, metodo:'efectivo'}};
     S.view='form'; S.sub='abono'; render(); window.scrollTo(0,0);
   },
+  toggleRetornos(){
+    const g=i=>(document.getElementById(i)||{}).value||'';
+    S.ctx.abono=Object.assign({},S.ctx.abono,{monto:g('ab_monto'), referencia:g('ab_ref'),
+      usarRetornos:(document.getElementById('ab_usaret')||{}).checked});
+    render();
+  },
   abonoMetodo(m){ S.ctx.abono.monto=(document.getElementById('ab_monto')||{}).value||''; S.ctx.abono.metodo=m; render(); },
   abonoTodo(){ const i=document.getElementById('ab_monto'); if(i){ i.value=S.ctx.abono.deuda; this.abonoCalc(); } },
   abonoCalc(){
     const a=S.ctx.abono, v=parseInt((document.getElementById('ab_monto')||{}).value)||0;
-    const monto=Math.min(Math.max(0,v), a.deuda), queda=a.deuda-monto;
+    const tope=topeAbono(a);
+    const desc=retornosQueCaben(a).valor;
+    const monto=Math.min(Math.max(0,v), tope), queda=tope-monto;
     const t=document.getElementById('ab_res');
-    if(t) t.innerHTML = monto<1 ? '<span style="color:var(--ink-soft)">Escribe cuánto '+(a.modo==='cobro'?'abona':'pagas')+'</span>'
-      : (queda<1 ? `<b style="color:var(--verde)">Queda saldada por completo</b>`
-                 : `Abona ${$(monto)} · ${a.modo==='cobro'?'le queda debiendo':'te quedarías debiendo'} <b style="color:var(--mango-text)">${$(queda)}</b>`);
-    if(v>a.deuda && document.getElementById('ab_monto')) document.getElementById('ab_monto').value=a.deuda;
+    if(t){
+      if(monto<1 && desc<1) t.innerHTML='<span style="color:var(--ink-soft)">Escribe cuánto '+(a.modo==='cobro'?'abona':'pagas')+'</span>';
+      else t.innerHTML = (queda<1 ? `<b style="color:var(--verde)">Queda a paz y salvo</b>`
+        : `${a.modo==='cobro'?'Le queda debiendo':'Te quedarías debiendo'} <b style="color:var(--warn)">${$(queda)}</b>`)
+        + (desc>0 ? `<div class="sub" style="margin-top:4px">Devuelto ${$(desc)} + plata ${$(monto)} = ${$(desc+monto)} de ${$(a.deuda)}</div>` : '');
+    }
+    if(v>tope && document.getElementById('ab_monto')) document.getElementById('ab_monto').value=tope;
   },
   async subirFoto(ev){
     const f=ev.target.files&&ev.target.files[0]; ev.target.value='';
@@ -1932,8 +2103,11 @@ const App = {
   },
   async guardarAbono(){
     const a=S.ctx.abono; if(!a) return;
-    const monto=Math.min(parseInt((document.getElementById('ab_monto')||{}).value)||0, a.deuda);
-    if(monto<1){ toast('Escribe cuánto '+(a.modo==='cobro'?'abona':'pagas')); return; }
+    const rq = retornosQueCaben(a);
+    const pend = rq.caben;
+    const descuento = rq.valor;
+    const monto=Math.min(parseInt((document.getElementById('ab_monto')||{}).value)||0, topeAbono(a));
+    if(monto<1 && descuento<1){ toast('Escribe cuánto '+(a.modo==='cobro'?'abona':'pagas')); return; }
     const referencia=((document.getElementById('ab_ref')||{}).value||'').trim();
     let comprobante=null;
     if(a.foto){ toast('Guardando el comprobante...'); comprobante=await guardarComprobante(a.foto); }
@@ -1953,6 +2127,25 @@ const App = {
     const recibo='A-'+String(DB.consecutivoAbono||1).padStart(4,'0');
     DB.consecutivoAbono=(DB.consecutivoAbono||1)+1;
     const datos=Object.assign({recibo},base);
+
+    /* 1) Primero se descuenta lo devuelto: NO es plata, es venta que se deshace */
+    let aplicadoRet=[];
+    if(descuento>0){
+      const rDatos={metodo:'devolucion', referencia:'', fecha:base.fecha, ts:base.ts, recibo,
+        usuarioId:base.usuarioId, usuario:base.usuario, esRetorno:true};
+      aplicadoRet=this.repartirAbono(a.cid, descuento, rDatos).aplicado;
+      pend.forEach(r=>{ r.aplicado=true; r.aplicadoFecha=base.fecha; r.recibo=recibo; });
+      /* La que no cabía entera se parte: una mitad aplicada, la otra sigue a favor */
+      if(rq.parcial){
+        const r=rq.parcial.r;
+        DB.retornos.push({id:uid(), clienteId:r.clienteId, prodId:r.prodId, qty:rq.parcial.qty,
+          precio:r.precio, fecha:r.fecha, ts:r.ts, aplicado:true, aplicadoFecha:base.fecha,
+          recibo, usuario:r.usuario||''});
+        r.qty = r.qty - rq.parcial.qty;
+      }
+    }
+
+    /* 2) Después entra la plata */
     let aplicado;
     if(a.fid){
       const f=DB.fiados.find(x=>x.id===a.fid);
@@ -1960,14 +2153,16 @@ const App = {
       if(saldoFiado(f)<1) f.estado='pagado';
       aplicado=[{fiadoId:f.id,detalle:f.detalle,fecha:f.fecha,parte:monto,quedo:saldoFiado(f)}];
     } else {
-      aplicado=this.repartirAbono(a.cid, monto, datos).aplicado;
+      aplicado = monto>0 ? this.repartirAbono(a.cid, monto, datos).aplicado : [];
     }
     const restante=DB.fiados.filter(f=>f.clienteId===a.cid && f.estado!=='pagado')
       .reduce((t,f)=>t+saldoFiado(f),0);
-    S.ctx={ultimoAbono:{cid:a.cid, monto, recibo, metodo:a.metodo, referencia,
-      fecha:base.fecha, ts:base.ts, aplicado, restante}};
+    S.ctx={ultimoAbono:{cid:a.cid, monto, descuento, recibo, metodo:a.metodo, referencia,
+      fecha:base.fecha, ts:base.ts, aplicado:[...aplicadoRet,...aplicado], restante}};
     await persist(); App.irA('cobros');
-    toast(`Abono de ${$(monto)} · quedan debiendo ${$(restante)}`);
+    toast(descuento>0
+      ? `Descontado ${$(descuento)} en producto + ${$(monto)} en plata · quedan debiendo ${$(restante)}`
+      : `Abono de ${$(monto)} · quedan debiendo ${$(restante)}`);
   },
   async loginSoporte(){
     const c=((document.getElementById('lk_user')||{}).value||'').trim().toLowerCase();
@@ -2055,7 +2250,7 @@ const App = {
     if(!esAdmin()){ toast('Solo el administrador'); return; }
     /* Blindaje explicito: estas llaves NO se tocan jamas en este reset. */
     const PROTEGIDAS=['productos','clientes','usuarios','insumos','proveedores','negocio','licencia','creatorPin'];
-    const OPERATIVAS=['dias','fiados','compras','cotizaciones','deudas','papelera'];
+    const OPERATIVAS=['dias','fiados','compras','cotizaciones','deudas','papelera','retornos'];
     const antes={}; PROTEGIDAS.forEach(k=>antes[k]=JSON.stringify(DB[k]));
     const mov=(DB.dias||[]).reduce((t,d)=>t+d.mayoreo.length+(d.libres||[]).length+d.gastos.length+d.mermas.length+(d.devoluciones||[]).length,0);
     if(!mov && !(DB.fiados||[]).length){ toast('Ya está limpio, no hay movimientos'); return; }
@@ -2528,7 +2723,7 @@ document.addEventListener('input',e=>{ if(e.target.id==='f_precio') e.target.dat
    3) Anti-retroceso de reloj: DB.licencia.maxDate.
    Acceso al panel oculto: toca el logo (login/bloqueo) o la marca de arriba
    5 veces y entra con el PIN de creador (DB.creatorPin, por defecto 2468). */
-const APP_VER = 'v21';
+const APP_VER = 'v23';
 const GRACIA_DIAS = 7;
 /* Cuenta de soporte del creador. No vive en DB.usuarios: el cliente no la ve,
    no la puede editar ni borrar, y sobrevive aunque cambie todas las claves.
@@ -2677,6 +2872,7 @@ function sanea(){
   if(!DB.consecutivoAbono) DB.consecutivoAbono=1;
   DB.deudas=DB.deudas||[];
   DB.papelera=DB.papelera||[];
+  DB.retornos=DB.retornos||[];
   // ---- Migración al libro por fechas (corre una sola vez) ----
   if(!DB.dias){
     DB.dias=[];
