@@ -383,16 +383,14 @@ async function guardarComprobante(dataUrl){
   if(USE_FIRESTORE && _fsRef){
     try{ await _fsRef.collection('comprobantes').doc(id).set({img:dataUrl, ts:Date.now()}); return id; }catch(e){}
   }
-  try{ if(window.storage){ await window.storage.set('comp_'+id, dataUrl); return id; } }catch(e){}
-  return null;
+  try{ localStorage.setItem('comp_'+id, dataUrl); return id; }catch(e){ return null; }
 }
 async function leerComprobante(id){
   if(!id) return null;
   if(USE_FIRESTORE && _fsRef){
     try{ const d=await _fsRef.collection('comprobantes').doc(id).get(); if(d.exists) return d.data().img; }catch(e){}
   }
-  try{ if(window.storage){ const r=await window.storage.get('comp_'+id); return r?r.value:null; } }catch(e){}
-  return null;
+  try{ return localStorage.getItem('comp_'+id); }catch(e){ return null; }
 }
 /* Comprime fuerte: un pantallazo de Nequi baja de ~100KB a ~20KB sin perder lectura */
 function comprimirFoto(file, ladoMax=760, tope=42000){
@@ -415,6 +413,49 @@ function comprimirFoto(file, ladoMax=760, tope=42000){
     r.onerror=()=>no(); r.readAsDataURL(file);
   });
 }
+/* Los cobros hechos antes de que existiera el archivo se reconstruyen desde
+   los abonos guardados en cada fiado, agrupándolos por recibo. */
+function reconstruirPagos(){
+  try{
+    const yaHay=new Set((DB.pagos||[]).map(p=>p.recibo).filter(Boolean));
+    const grupos={};
+    (DB.fiados||[]).forEach(f=>{
+      (f.abonos||[]).forEach(a=>{
+        if(typeof a==='number') return;
+        const rec=a.recibo||('viejo-'+f.id+'-'+(a.id||''));
+        if(yaHay.has(rec)) return;
+        const g=grupos[rec]=grupos[rec]||{recibo:a.recibo||'', clienteId:f.clienteId,
+          fecha:a.fecha||f.fecha, ts:a.ts||0, usuario:a.usuario||'',
+          metodo:a.metodo==='transferencia'?'transferencia':'efectivo',
+          referencia:a.referencia||'', comprobante:a.comprobante||null,
+          plata:0, devuelto:0, fiados:[], devoluciones:[]};
+        const monto=montoAbono(a);
+        if(a.esRetorno) g.devuelto+=monto; else g.plata+=monto;
+        g.fiados.push({fecha:f.fecha, detalle:f.detalle, parte:monto,
+          quedo:saldoFiado(f), via:a.esRetorno?'devuelto':'plata'});
+        if(a.comprobante && !g.comprobante) g.comprobante=a.comprobante;
+      });
+    });
+    /* El detalle de producto devuelto sale de DB.retornos ya aplicados */
+    (DB.retornos||[]).filter(r=>r.aplicado && r.recibo).forEach(r=>{
+      const g=grupos[r.recibo]; if(!g) return;
+      g.devoluciones.push({prodId:r.prodId, nombre:prod(r.prodId).nombre, qty:r.qty,
+        precio:r.precio, valor:valorRetorno(r), fecha:r.fecha});
+    });
+    const nuevos=Object.values(grupos).map(g=>Object.assign(g,{
+      id:uid(), cliente:cliente(g.clienteId).nombre,
+      cubierto:g.plata+g.devuelto, deudaAntes:0,
+      saldoDespues:(DB.fiados||[]).filter(f=>f.clienteId===g.clienteId&&f.estado!=='pagado')
+        .reduce((t,f)=>t+saldoFiado(f),0),
+      reconstruido:true
+    }));
+    if(nuevos.length){
+      DB.pagos=[...nuevos,...(DB.pagos||[])]
+        .sort((a,b)=> a.fecha===b.fecha ? ((b.ts||0)-(a.ts||0)) : (a.fecha<b.fecha?1:-1))
+        .slice(0,400);
+    }
+  }catch(e){ console.warn('reconstruirPagos:',e); }
+}
 async function initFirestore(){
   firebase.initializeApp(FIREBASE_CONFIG);
   const fs=firebase.firestore();
@@ -434,8 +475,15 @@ async function initFirestore(){
     }catch(e){}
   }
 }
-async function localLoad(){ try{ if(window.storage){ const r=await window.storage.get(LKEY); return r? JSON.parse(r.value):null; } }catch(e){} return null; }
-async function localSave(db){ try{ if(window.storage){ await window.storage.set(LKEY, JSON.stringify(db)); } }catch(e){} }
+async function localLoad(){ try{ const t=localStorage.getItem(LKEY); return t? JSON.parse(t):null; }catch(e){ return null; } }
+async function localSave(db){
+  try{ localStorage.setItem(LKEY, JSON.stringify(db)); }
+  catch(e){
+    /* Sin espacio: es mejor avisar que perder el registro en silencio */
+    try{ toast('No se pudo guardar en el celular (sin espacio). Libera espacio o revisa tu conexión.'); }catch(e2){}
+    console.error('localSave fallo:', e);
+  }
+}
 const Store = {
   async load(){
     if(USE_FIRESTORE && _docRef){ try{ const d=await _docRef.get(); return (d.exists && d.data().db)? d.data().db : null; }catch(e){ return localLoad(); } }
@@ -1416,8 +1464,21 @@ function vInforme(){
   const nPed=j.mayoreo.length+(j.libres||[]).length;
   const clis=new Set([...j.mayoreo,...(j.libres||[])].filter(x=>x.clienteId).map(x=>x.clienteId));
   const fiadosDia=[...j.mayoreo,...(j.libres||[])].filter(x=>x.estado==='fiado');
+  const cobrosDia=(DB.pagos||[]).filter(p=>p.fecha===j.fecha);
+  const devDia=cobrosDia.reduce((t,p)=>t+(p.devuelto||0),0);
+  const plataDia=cobrosDia.reduce((t,p)=>t+(p.plata||0),0);
   return `<div class="view-title">Informe del ${fmtFecha(j.fecha)}</div>
     <div class="view-sub">Recibido ${$(tot.ingMayoreoPag+(tot.ingLibresPag||0))} &middot; ${nombreUsuario(j.trabajadorId)}</div>
+    ${cobrosDia.length?`<div class="card"><h3>Cobros de deudas este día</h3>
+      ${cobrosDia.map(p=>`<div class="row"><div style="min-width:0">
+        <div class="lab">${p.cliente||'—'}</div>
+        <div class="sub">${p.recibo||''}${p.devuelto>0?` · le descontaste ${$(p.devuelto)} en producto`:''}</div>
+        ${(p.devoluciones||[]).map(d=>`<div class="sub" style="color:var(--warn);font-size:11px">${d.qty} × ${d.nombre} · ${$(d.valor)}</div>`).join('')}
+        </div><div class="val" style="color:var(--verde)">${$(p.plata)}</div></div>`).join('')}
+      <div class="row" style="border-bottom:none"><div><div class="lab">Total cobrado en plata</div>
+        ${devDia>0?`<div class="sub" style="color:var(--warn)">más ${$(devDia)} descontado en producto devuelto</div>`:''}</div>
+        <div class="val" style="color:var(--verde)">${$(plataDia)}</div></div>
+    </div>`:''}
     ${[...j.mayoreo,...(j.libres||[])].some(m=>m.transferencia>0)?`<div class="card"><h3>Transferencias del día</h3>${[...j.mayoreo,...(j.libres||[])].filter(m=>m.transferencia>0).map(m=>`
       <div class="row"><div><div class="lab">${m.clienteId?cliente(m.clienteId).nombre:'Venta libre'}</div><div class="sub">${m.referencia?('Ref. '+m.referencia):'Sin referencia'}</div></div>
       <div style="text-align:right"><div class="val">${$(m.transferencia)}</div>${m.verificada?'<span class="pill v">Verificada</span>':'<span class="pill p">Por verificar</span>'}</div></div>`).join('')}</div>`:''}
@@ -1694,7 +1755,12 @@ function vPagos(){
     <div class="row" style="border-bottom:none;padding-top:0">
       <div class="sub">${p.saldoDespues>0?'Le quedó debiendo':'Quedó a paz y salvo'}</div>
       <div class="val" style="color:${p.saldoDespues>0?'var(--warn)':'var(--verde)'}">${$(p.saldoDespues)}</div></div>
-    ${p.comprobante?`<button class="btn btn-line btn-sm" onclick="App.verFoto('${p.comprobante}')">Ver comprobante</button>`:''}
+    ${p.comprobante?`<button class="btn btn-line btn-sm" onclick="App.verFoto('${p.comprobante}')">Ver comprobante</button><div style="height:8px"></div>`:''}
+    ${p.reconstruido?'<div class="hint" style="margin:0">Cobro anterior al historial: se reconstruyó desde los abonos guardados.</div>':`
+    <div style="display:flex;gap:8px">
+      ${p.metodo==='transferencia'?`<button class="btn btn-ghost btn-sm" style="flex:1" onclick="App.editarRefPago('${p.id}')">Corregir referencia</button>`:''}
+      <button class="btn btn-ghost btn-sm" style="flex:1;color:var(--coral)" onclick="App.deshacerPago('${p.id}')">Deshacer cobro</button>
+    </div>`}
   </div>`;
 
   return `<div class="view-title">Historial de pagos</div>
@@ -2182,6 +2248,41 @@ const App = {
     d.innerHTML=`<img src="${data}" alt="Comprobante"><button class="vcerrar">Cerrar</button>`;
     d.onclick=()=>d.remove();
     document.body.appendChild(d);
+  },
+  async deshacerPago(pid){
+    const p=(DB.pagos||[]).find(x=>x.id===pid); if(!p) return;
+    if(p.reconstruido){ toast('Este cobro es de antes del historial y no se puede deshacer desde aquí'); return; }
+    if(p.tipo==='pago-propio'){ toast('Los pagos a proveedores se corrigen en Tú debes'); return; }
+    if(!confirm('DESHACER ESTE COBRO\n\n'+p.cliente+' · '+fmtFecha(p.fecha)+'\n'
+      +'Plata: '+$(p.plata)+(p.devuelto>0?'\nProducto devuelto: '+$(p.devuelto):'')+'\n\n'
+      +'La deuda vuelve a quedar abierta'+(p.devuelto>0?' y el producto devuelto vuelve a quedar pendiente':'')
+      +'.\n\n¿Seguro?')) return;
+    if(!confirm('Confírmame otra vez: se va a borrar este cobro de '+$(p.cubierto)+'.')) return;
+
+    /* 1) Quitar los abonos que llevan este recibo */
+    (DB.fiados||[]).forEach(f=>{
+      if(!f.abonos) return;
+      const antes=f.abonos.length;
+      f.abonos=f.abonos.filter(a=>!(a && a.recibo===p.recibo));
+      if(f.abonos.length!==antes && saldoFiado(f)>0) f.estado='abierto';
+    });
+    /* 2) Las devoluciones vuelven a quedar a favor del cliente */
+    (DB.retornos||[]).forEach(r=>{ if(r.recibo===p.recibo){ r.aplicado=false; r.aplicadoFecha=null; r.recibo=null; } });
+    /* 3) Sale del historial, pero queda en la papelera por si acaso */
+    DB.papelera.unshift({id:uid(),tipo:'cobro',fecha:p.fecha,borrado:today(),ts:Date.now(),
+      usuario:S.user?S.user.nombre:'', registro:p, fiados:[]});
+    DB.papelera=DB.papelera.slice(0,80);
+    DB.pagos=DB.pagos.filter(x=>x.id!==pid);
+    await persist(); render();
+    toast('Cobro deshecho — la deuda volvió a quedar abierta');
+  },
+  async editarRefPago(pid){
+    const p=(DB.pagos||[]).find(x=>x.id===pid); if(!p) return;
+    const v=prompt('Referencia de la transferencia:', p.referencia||'');
+    if(v===null) return;
+    p.referencia=v.trim();
+    (DB.fiados||[]).forEach(f=>(f.abonos||[]).forEach(a=>{ if(a&&a.recibo===p.recibo) a.referencia=p.referencia; }));
+    await persist(); render(); toast('Referencia corregida');
   },
   async guardarAbono(){
     const a=S.ctx.abono; if(!a) return;
@@ -2832,7 +2933,7 @@ document.addEventListener('input',e=>{ if(e.target.id==='f_precio') e.target.dat
    3) Anti-retroceso de reloj: DB.licencia.maxDate.
    Acceso al panel oculto: toca el logo (login/bloqueo) o la marca de arriba
    5 veces y entra con el PIN de creador (DB.creatorPin, por defecto 2468). */
-const APP_VER = 'v24';
+const APP_VER = 'v26';
 const GRACIA_DIAS = 7;
 /* Cuenta de soporte del creador. No vive en DB.usuarios: el cliente no la ve,
    no la puede editar ni borrar, y sobrevive aunque cambie todas las claves.
@@ -2983,6 +3084,7 @@ function sanea(){
   DB.papelera=DB.papelera||[];
   DB.retornos=DB.retornos||[];
   DB.pagos=DB.pagos||[];
+  if(!DB.pagosReconstruidos){ reconstruirPagos(); DB.pagosReconstruidos=true; }
   // ---- Migración al libro por fechas (corre una sola vez) ----
   if(!DB.dias){
     DB.dias=[];
