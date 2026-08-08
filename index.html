@@ -176,6 +176,8 @@ main{flex:1;width:100%;max-width:560px;margin:0 auto;padding:22px 18px 44px}
 .chips button.on{background:linear-gradient(180deg,#2D5492,#14264C);border-color:#14264C;color:#fff;box-shadow:0 6px 16px -8px rgba(20,38,76,.45)}
 .vnueva{position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:60;display:flex;align-items:center;gap:14px;background:var(--ink);color:#fff;padding:13px 16px;border-radius:14px;box-shadow:var(--shadow);font-size:13.5px;font-weight:700;max-width:92%}
 .vnueva button{border:none;border-radius:9px;padding:8px 14px;background:var(--verde);color:#fff;font:inherit;font-size:13px;font-weight:800;cursor:pointer;flex:0 0 auto}
+body.sinnube:not(.offline):not(.sincola) .topbar::after{content:'Solo en este celular';margin-left:auto;flex:0 0 auto;background:var(--gold-tint);color:var(--oro-text);border:1px solid #EAD9A8;font-size:10.5px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;padding:5px 10px;border-radius:999px}
+body.sincola:not(.offline) .topbar::after{content:'Sin subir';margin-left:auto;flex:0 0 auto;background:var(--gold-tint);color:var(--oro-text);border:1px solid #EAD9A8;font-size:10.5px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;padding:5px 10px;border-radius:999px}
 body.offline .topbar::after{content:'Sin internet';margin-left:auto;flex:0 0 auto;background:var(--mango-tint);color:var(--mango-text);border:1px solid #EAD9A8;font-size:10.5px;font-weight:800;letter-spacing:.04em;text-transform:uppercase;padding:5px 10px;border-radius:999px}
 .mgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .mpick{display:flex;flex-direction:column;align-items:center;gap:7px;padding:16px 10px;border:1.5px solid var(--line);border-radius:14px;background:var(--surface);font:inherit;color:var(--ink-soft);cursor:pointer}
@@ -193,7 +195,7 @@ body.offline .topbar::after{content:'Sin internet';margin-left:auto;flex:0 0 aut
 .vcerrar{border:none;border-radius:12px;padding:12px 26px;background:#fff;color:var(--ink);font:inherit;font-size:14px;font-weight:800;cursor:pointer}
 .dprog{height:7px;border-radius:99px;background:var(--line);overflow:hidden;margin:10px 0 8px}
 .dprog i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--verde),#7FCBA6)}
-.lincard{border:1px solid var(--line);border-radius:14px;padding:2px 14px;margin-bottom:16px;background:var(--bg-subtle,#FAF7EF)}
+.lincard{border:1px solid var(--line);border-radius:14px;padding:2px 14px;margin-bottom:16px;background:var(--papel)}
 .linrow{display:flex;align-items:center;gap:10px;padding:11px 0;border-bottom:1px solid var(--line)}
 .linrow:last-child{border-bottom:none}
 .lintx{flex:1;min-width:0}
@@ -374,6 +376,19 @@ const FIREBASE_CONFIG = {
 const USE_FIRESTORE = !!(window.firebase && FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.apiKey.indexOf('PEGA_AQUI')===-1);
 const LKEY='las_antioquenas_db_v1';
 let _docRef=null;
+/* Sesión de nube: sin sesión, _docRef queda en null y la app trabaja
+   100% local. Nada se sube a ninguna parte hasta que haya llave. */
+let _uid=null, _correoNube='', _authRef=null, _suscrito=false;
+function aplicarSesion(u){
+  if(u && u.uid){
+    _uid=u.uid; _correoNube=u.email||'';
+    _docRef=_fsRef ? _fsRef.collection('negocios').doc(_uid) : null;
+  } else { _uid=null; _correoNube=''; _docRef=null; }
+  try{ document.body.classList.toggle('sinnube', !_docRef); }catch(e){}
+}
+function nubeActiva(){ return !!(USE_FIRESTORE && _docRef); }
+function refLicencia(){ return _docRef ? _docRef.collection('meta').doc('licencia') : null; }
+function refComprobantes(){ return _docRef ? _docRef.collection('comprobantes') : null; }
 /* Los comprobantes NO viven en app/data: cada foto va en su propio documento.
    Si fueran al documento principal, 16 fotos reventarían la base y cada venta
    reenviaría todas las imágenes por el aire. */
@@ -381,14 +396,14 @@ async function guardarComprobante(dataUrl){
   if(!dataUrl) return null;
   const id='c'+uid();
   if(USE_FIRESTORE && _fsRef){
-    try{ await _fsRef.collection('comprobantes').doc(id).set({img:dataUrl, ts:Date.now()}); return id; }catch(e){}
+    try{ const R=refComprobantes(); if(R){ await R.doc(id).set({img:dataUrl, ts:Date.now()}); return id; } }catch(e){}
   }
   try{ localStorage.setItem('comp_'+id, dataUrl); return id; }catch(e){ return null; }
 }
 async function leerComprobante(id){
   if(!id) return null;
   if(USE_FIRESTORE && _fsRef){
-    try{ const d=await _fsRef.collection('comprobantes').doc(id).get(); if(d.exists) return d.data().img; }catch(e){}
+    try{ const R=refComprobantes(); if(R){ const d=await R.doc(id).get(); if(d.exists) return d.data().img; } }catch(e){}
   }
   try{ return localStorage.getItem('comp_'+id); }catch(e){ return null; }
 }
@@ -413,67 +428,80 @@ function comprimirFoto(file, ladoMax=760, tope=42000){
     r.onerror=()=>no(); r.readAsDataURL(file);
   });
 }
-/* Los cobros hechos antes de que existiera el archivo se reconstruyen desde
-   los abonos guardados en cada fiado, agrupándolos por recibo. */
-function reconstruirPagos(){
-  try{
-    const yaHay=new Set((DB.pagos||[]).map(p=>p.recibo).filter(Boolean));
-    const grupos={};
-    (DB.fiados||[]).forEach(f=>{
-      (f.abonos||[]).forEach(a=>{
-        if(typeof a==='number') return;
-        const rec=a.recibo||('viejo-'+f.id+'-'+(a.id||''));
-        if(yaHay.has(rec)) return;
-        const g=grupos[rec]=grupos[rec]||{recibo:a.recibo||'', clienteId:f.clienteId,
-          fecha:a.fecha||f.fecha, ts:a.ts||0, usuario:a.usuario||'',
-          metodo:a.metodo==='transferencia'?'transferencia':'efectivo',
-          referencia:a.referencia||'', comprobante:a.comprobante||null,
-          plata:0, devuelto:0, fiados:[], devoluciones:[]};
-        const monto=montoAbono(a);
-        if(a.esRetorno) g.devuelto+=monto; else g.plata+=monto;
-        g.fiados.push({fecha:f.fecha, detalle:f.detalle, parte:monto,
-          quedo:saldoFiado(f), via:a.esRetorno?'devuelto':'plata'});
-        if(a.comprobante && !g.comprobante) g.comprobante=a.comprobante;
-      });
-    });
-    /* El detalle de producto devuelto sale de DB.retornos ya aplicados */
-    (DB.retornos||[]).filter(r=>r.aplicado && r.recibo).forEach(r=>{
-      const g=grupos[r.recibo]; if(!g) return;
-      g.devoluciones.push({prodId:r.prodId, nombre:prod(r.prodId).nombre, qty:r.qty,
-        precio:r.precio, valor:valorRetorno(r), fecha:r.fecha});
-    });
-    const nuevos=Object.values(grupos).map(g=>Object.assign(g,{
-      id:uid(), cliente:cliente(g.clienteId).nombre,
-      cubierto:g.plata+g.devuelto, deudaAntes:0,
-      saldoDespues:(DB.fiados||[]).filter(f=>f.clienteId===g.clienteId&&f.estado!=='pagado')
-        .reduce((t,f)=>t+saldoFiado(f),0),
-      reconstruido:true
-    }));
-    if(nuevos.length){
-      DB.pagos=[...nuevos,...(DB.pagos||[])]
-        .sort((a,b)=> a.fecha===b.fecha ? ((b.ts||0)-(a.ts||0)) : (a.fecha<b.fecha?1:-1))
-        .slice(0,400);
-    }
-  }catch(e){ console.warn('reconstruirPagos:',e); }
-}
 async function initFirestore(){
   firebase.initializeApp(FIREBASE_CONFIG);
   const fs=firebase.firestore();
   fs.enablePersistence({synchronizeTabs:true}).catch(()=>{});
-  _docRef=fs.collection('app').doc('data');
   _fsRef=fs;
-  /* Sesion anonima: la exigen las reglas de seguridad.
-     Si Auth anonima no esta activada en la consola, seguimos igual:
-     con reglas abiertas funciona, y con reglas cerradas cae a modo local. */
-  if(firebase.auth){
+  /* Ya NO hay sesión anónima: con sesión anónima cualquiera en internet podía
+     entrar al proyecto y leer la base del cliente. Ahora la nube solo se abre
+     con la llave del negocio (correo + contraseña). Sin llave, todo local. */
+  if(!firebase.auth){ aplicarSesion(null); return; }
+  _authRef=firebase.auth();
+  try{ await _authRef.setPersistence(firebase.auth.Auth.Persistence.LOCAL); }catch(e){}
+  await new Promise(ok=>{
+    let listo=false;
+    const cerrar=()=>{ if(listo) return; listo=true; ok(); };
+    const t=setTimeout(cerrar,6000);                    /* no dejar la app colgada */
     try{
-      await new Promise((ok)=>{
-        const t=setTimeout(ok,6000);                    // no dejar la app colgada
-        firebase.auth().onAuthStateChanged(u=>{ if(u){ clearTimeout(t); ok(); } });
-        firebase.auth().signInAnonymously().catch(()=>{ clearTimeout(t); ok(); });
+      const off=_authRef.onAuthStateChanged(u=>{
+        clearTimeout(t); aplicarSesion(u); try{ off(); }catch(e){} cerrar();
       });
-    }catch(e){}
-  }
+    }catch(e){ clearTimeout(t); aplicarSesion(null); cerrar(); }
+  });
+}
+function msgAuth(e){
+  const c=(e&&e.code)||'';
+  if(c.indexOf('wrong-password')>=0||c.indexOf('invalid-credential')>=0) return 'Contraseña incorrecta';
+  if(c.indexOf('user-not-found')>=0)  return 'Ese correo no tiene negocio creado';
+  if(c.indexOf('invalid-email')>=0)   return 'Ese correo no está bien escrito';
+  if(c.indexOf('too-many-requests')>=0) return 'Demasiados intentos. Espera un momento';
+  if(c.indexOf('network')>=0)         return 'Sin internet para verificar la llave';
+  return 'No se pudo conectar';
+}
+/* Rescate: lo que quedó en la ruta vieja y abierta se trae una sola vez. */
+async function rescatarLegado(){
+  if(!(_fsRef && _docRef)) return false;
+  try{
+    const nuevo=await _docRef.get();
+    if(nuevo.exists && nuevo.data() && nuevo.data().db) return false;
+    const viejo=await _fsRef.collection('app').doc('data').get();
+    if(!(viejo.exists && viejo.data() && viejo.data().db)) return false;
+    DB=fusionar(DB, viejo.data().db); _huella=null; sellar(DB); localSave(DB);
+    return true;
+  }catch(e){ return false; }
+}
+/* Enciende la nube: rescata lo viejo, sube lo de este celular y se queda oyendo */
+async function arrancarNube(){
+  if(!nubeActiva()) return;
+  await rescatarLegado();
+  await subirFusionado();
+  if(_suscrito) return;
+  _suscrito=true;
+  Store.subscribe(()=>{
+    sanea();
+    if(S.view==='form' || S.creator){
+      toast('Llegaron registros del otro celular. Lo tuyo no se perdió.');
+      return;
+    }
+    render();
+  });
+}
+async function nubeEntrar(correo, clave){
+  if(!(USE_FIRESTORE && _authRef)) return {ok:false, msg:'Esta app no tiene nube configurada'};
+  try{
+    const cred=await _authRef.signInWithEmailAndPassword((correo||'').trim(), clave||'');
+    aplicarSesion(cred.user);
+    if(!_docRef) return {ok:false, msg:'No se pudo abrir el negocio'};
+    DB.nube=Object.assign({}, DB.nube||{}, {uid:_uid, correo:_correoNube, desde:today()});
+    await arrancarNube();
+    await persist();
+    return {ok:true};
+  }catch(e){ aplicarSesion(null); return {ok:false, msg:msgAuth(e)}; }
+}
+async function nubeSalir(){
+  try{ if(_authRef) await _authRef.signOut(); }catch(e){}
+  aplicarSesion(null); marcarPendiente(false);
 }
 async function localLoad(){ try{ const t=localStorage.getItem(LKEY); return t? JSON.parse(t):null; }catch(e){ return null; } }
 /* Copia de emergencia antes de una operación destructiva. Vive aparte de la
@@ -534,15 +562,224 @@ function localSave(db){
     return false;
   }
 }
+
+/* ==========================================================================
+   SINCRONIZACION SIN PERDIDAS  (v31)
+   Antes cada guardado reescribia el documento entero: si el Dueño y el
+   trabajador registraban con minutos de diferencia, el ultimo guardado
+   borraba lo del otro. Ahora nada se reemplaza, se FUSIONA registro por
+   registro. Cada registro lleva su sello de tiempo (_v) y cada borrado deja
+   una lapida (_tumbas), asi que borrar tambien viaja al otro celular.
+   ========================================================================== */
+const M_LISTAS   = { productos:'id', clientes:'id', usuarios:'id', fiados:'id',
+  insumos:'id', proveedores:'id', compras:'id', cotizaciones:'id', deudas:'id',
+  retornos:'id', pagos:'id', papelera:'id', dias:'fecha' };
+const M_SUBLISTAS= { fiados:['abonos'], deudas:['abonos'],
+  dias:['mayoreo','libres','gastos','mermas','devoluciones'] };
+const M_OBJETOS  = ['negocio','licencia'];
+const M_MAXIMOS  = ['consecutivo','consecutivoAbono'];
+const M_TOPES    = { pagos:400, papelera:80 };
+const MS_LAPIDA  = 60*24*60*60*1000;   /* una lapida vive 60 dias */
+
+let _huella = null;   /* como estaba la base en el ultimo guardado */
+
+function _sinSello(k,v){ return k==='_v' ? undefined : v; }
+function ver(o){ return (o && typeof o._v==='number') ? o._v : 0; }
+function _esReg(x){ return x && typeof x==='object' && !Array.isArray(x); }
+
+/* Recorre todo lo que es "un registro" y le entrega su ruta unica */
+function _recorrer(db, cb){
+  if(!_esReg(db)) return;
+  Object.keys(M_LISTAS).forEach(k=>{
+    const llave=M_LISTAS[k];
+    (Array.isArray(db[k])?db[k]:[]).forEach(r=>{
+      if(!_esReg(r) || r[llave]==null) return;
+      const ruta=k+'|'+r[llave];
+      cb(ruta, r);
+      (M_SUBLISTAS[k]||[]).forEach(sub=>{
+        (Array.isArray(r[sub])?r[sub]:[]).forEach(it=>{
+          if(!_esReg(it) || it.id==null) return;
+          cb(ruta+'|'+sub+'|'+it.id, it);
+        });
+      });
+    });
+  });
+  M_OBJETOS.forEach(k=>{ if(_esReg(db[k])) cb(k+'|@', db[k]); });
+}
+
+/* Firma corta: sirve para saber si dos bases dicen lo mismo sin comparar
+   el JSON completo (el orden de las llaves cambia y daria falsos positivos) */
+function firmaCorta(db){
+  const p=[];
+  _recorrer(db,(ruta,o)=>p.push(ruta+':'+ver(o)));
+  p.push('#'+(db&&db.consecutivo||0)+'/'+(db&&db.consecutivoAbono||0));
+  return p.sort().join(',');
+}
+
+function podarLapidas(lista){
+  const corte=Date.now()-MS_LAPIDA, m=new Map();
+  (Array.isArray(lista)?lista:[]).forEach(x=>{
+    if(!x||!x.r) return;
+    const t=Number(x.t)||0; if(t<corte) return;
+    if(!m.has(x.r) || t>m.get(x.r)) m.set(x.r,t);
+  });
+  return [...m].map(([r,t])=>({r,t})).sort((a,b)=>b.t-a.t).slice(0,3000);
+}
+
+/* Le pone la fecha de edicion a lo que cambio y deja lapida a lo que se fue.
+   Sin base de comparacion no inventa nada: solo rellena lo que falta. */
+function sellar(db){
+  try{
+    if(!_esReg(db)) return;
+    const ahora=Date.now(), base=_huella, nueva=new Map();
+    _recorrer(db,(ruta,obj)=>{
+      const txt=JSON.stringify(obj,_sinSello);
+      nueva.set(ruta,txt);
+      if(base && base.has(ruta) && base.get(ruta)!==txt){ obj._v=ahora; return; }
+      if(base && !base.has(ruta)){ obj._v=ahora; return; }
+      if(obj._v==null) obj._v=Number(obj.ts)||0;   /* viejo: no gana por accidente */
+    });
+    const lap=Array.isArray(db._tumbas)?db._tumbas:[];
+    if(base) base.forEach((_,ruta)=>{ if(!nueva.has(ruta)) lap.push({r:ruta,t:ahora}); });
+    db._tumbas=podarLapidas(lap);
+    _huella=nueva;
+  }catch(e){ console.warn('sellar:',e); }
+}
+
+function _mapa(arr,llave){
+  const m=new Map();
+  (Array.isArray(arr)?arr:[]).forEach(r=>{ if(_esReg(r)&&r[llave]!=null) m.set(String(r[llave]),r); });
+  return m;
+}
+
+/* Dos versiones del MISMO registro: gana el mas reciente en los campos
+   sueltos, pero las sublistas se unen item por item (asi no se pierde un
+   abono que se registro en el otro celular). */
+function fusionarRegistro(a,b,subs,rutaBase,lapidas){
+  const gana = ver(a)>=ver(b) ? a : b, pierde = ver(a)>=ver(b) ? b : a;
+  const out  = Object.assign({}, pierde, gana);
+  (subs||[]).forEach(sub=>{
+    const la=Array.isArray(a[sub])?a[sub]:[], lb=Array.isArray(b[sub])?b[sub]:[];
+    const conId=new Map();
+    [la,lb].forEach(lista=>lista.forEach(it=>{
+      if(!_esReg(it)||it.id==null) return;
+      const k=String(it.id), prev=conId.get(k);
+      if(!prev || ver(it)>ver(prev)) conId.set(k,it);
+    }));
+    /* items viejos sin id (abonos de version antigua): se toman del ganador */
+    const sueltos=(gana[sub]||[]).filter(it=>!_esReg(it)||it.id==null);
+    const vivos=[...conId.values()].filter(it=>{
+      const t=lapidas.get(rutaBase+'|'+sub+'|'+it.id);
+      return !(t!=null && t>=ver(it));
+    }).sort((x,y)=>(Number(x.ts)||0)-(Number(y.ts)||0));
+    out[sub]=[...sueltos,...vivos];
+  });
+  return out;
+}
+
+/* Une la base de este celular con la de la nube. Nunca borra por reemplazo. */
+function fusionar(local, remoto){
+  if(!_esReg(remoto)) return local;
+  if(!_esReg(local))  return remoto;
+  const out=Object.assign({}, remoto, local);   /* escalares sueltos: manda lo local */
+  const lapidas=new Map();
+  [remoto._tumbas, local._tumbas].forEach(l=>(Array.isArray(l)?l:[]).forEach(x=>{
+    if(!x||!x.r) return; const t=Number(x.t)||0;
+    if(!lapidas.has(x.r)||t>lapidas.get(x.r)) lapidas.set(x.r,t);
+  }));
+
+  Object.keys(M_LISTAS).forEach(k=>{
+    const llave=M_LISTAS[k], subs=M_SUBLISTAS[k];
+    const ml=_mapa(local[k],llave), mr=_mapa(remoto[k],llave);
+    const arr=[];
+    new Set([...ml.keys(),...mr.keys()]).forEach(id=>{
+      const a=ml.get(id), b=mr.get(id);
+      const reg = (a&&b) ? (subs? fusionarRegistro(a,b,subs,k+'|'+id,lapidas)
+                                : (ver(a)>=ver(b)?a:b))
+                         : (a||b);
+      const t=lapidas.get(k+'|'+id);
+      if(t!=null && t>=ver(reg)) return;   /* lo borraron despues de la ultima edicion */
+      arr.push(reg);
+    });
+    out[k]=arr;
+  });
+
+  M_OBJETOS.forEach(k=>{
+    const a=local[k], b=remoto[k];
+    out[k] = (_esReg(a)&&_esReg(b)) ? (ver(a)>=ver(b)?a:b) : (a||b);
+  });
+  M_MAXIMOS.forEach(k=>{
+    out[k]=Math.max(Number(local[k])||0, Number(remoto[k])||0)||1;
+  });
+
+  /* el orden que la app espera */
+  if(Array.isArray(out.dias))  out.dias.sort((a,b)=>a.fecha<b.fecha?1:-1);
+  if(Array.isArray(out.pagos)) out.pagos.sort((a,b)=> a.fecha===b.fecha ? ((b.ts||0)-(a.ts||0)) : (a.fecha<b.fecha?1:-1));
+  if(Array.isArray(out.papelera)) out.papelera.sort((a,b)=>(Number(b.ts)||0)-(Number(a.ts)||0));
+  Object.keys(M_TOPES).forEach(k=>{ if(Array.isArray(out[k])) out[k]=out[k].slice(0,M_TOPES[k]); });
+
+  out._tumbas=podarLapidas([...lapidas].map(([r,t])=>({r,t})));
+  return out;
+}
+
+/* ---- Cola de subida: si no hay señal queda pendiente y se reintenta ---- */
+const KPEND = LKEY+'_pendiente';
+let _subiendo=false, _pedido=false;
+function marcarPendiente(v){
+  try{ if(v) localStorage.setItem(KPEND,'1'); else localStorage.removeItem(KPEND); }catch(e){}
+  try{ document.body.classList.toggle('sincola', !!v); }catch(e){}
+}
+function haySincola(){ try{ return localStorage.getItem(KPEND)==='1'; }catch(e){ return false; } }
+
+async function subirFusionado(){
+  if(!(nubeActiva() && _fsRef)) return;
+  if(_subiendo){ _pedido=true; return; }
+  _subiendo=true;
+  try{
+    let resultado=null;
+    /* Techo de tiempo: si la red se queda pensando, no dejamos la subida
+       trabada para siempre. Se marca pendiente y se reintenta después. */
+    const conTope=(pr)=>Promise.race([pr,
+      new Promise((_,no)=>setTimeout(()=>no(new Error('tardo demasiado')),20000))]);
+    await conTope(_fsRef.runTransaction(async tx=>{
+      const snap=await tx.get(_docRef);
+      const d=snap.exists? snap.data():null;
+      const remoto=(d&&d.db)?d.db:null;
+      resultado = remoto ? fusionar(DB, remoto) : DB;
+      tx.set(_docRef,{db:resultado, rev:Date.now(), updatedAt:Date.now()});
+    }));
+    if(resultado && resultado!==DB){
+      /* La nube traia algo que aca no estaba: se adopta sin perder lo propio */
+      DB=resultado; _huella=null; sellar(DB); localSave(DB);
+      if(!(S.view==='form' || S.creator)){ try{ render(); }catch(e){} }
+      else { try{ toast('Llegaron registros del otro celular'); }catch(e){} }
+    }
+    marcarPendiente(false);
+  }catch(e){
+    marcarPendiente(true);   /* sin señal, choque o demora: se reintenta solo */
+  }finally{
+    _subiendo=false;
+    if(_pedido){ _pedido=false; setTimeout(subirFusionado,600); }
+  }
+}
+function reintentarCola(){
+  if(navigator.onLine && haySincola()) subirFusionado();
+}
+
 const Store = {
   async load(){
     /* Si la nube contesta vacío NO se devuelve null a secas: antes eso hacía que
        el arranque creara datos de demostración y los guardara ENCIMA de los del
        cliente. Siempre se cae a la copia del celular. */
-    if(USE_FIRESTORE && _docRef){
+    if(nubeActiva()){
       try{
         const d=await _docRef.get();
-        if(d.exists && d.data().db) return d.data().db;
+        if(d.exists && d.data() && d.data().db) return d.data().db;
+      }catch(e){}
+      /* Primera vez con llave: se rescata lo que estaba en la ruta vieja */
+      try{
+        const v=await _fsRef.collection('app').doc('data').get();
+        if(v.exists && v.data() && v.data().db) return v.data().db;
       }catch(e){}
       return localLoad();
     }
@@ -550,23 +787,30 @@ const Store = {
   },
   async save(db){
     _revLocal++;
-    /* 1) SIEMPRE Y PRIMERO el celular: es instantáneo y no depende de la señal.
-       Antes se esperaba a que la nube contestara, y sin señal esa espera no
-       terminaba nunca: la pantalla se quedaba pegada después de guardar. */
+    /* 1) Se le pone fecha de edición a lo que cambió y lápida a lo que se borró.
+       Esto es lo que después permite fusionar sin perder nada. */
+    sellar(db);
+    /* 2) SIEMPRE Y PRIMERO el celular: es instantáneo y no depende de la señal. */
     localSave(db);
-    /* 2) La nube va después y SIN frenar la pantalla. Si no hay señal, Firestore
-       la deja en su cola y la sube solo cuando vuelva. */
-    if(USE_FIRESTORE && _docRef){
-      try{ _docRef.set({db, rev:_revLocal, updatedAt:Date.now()}).catch(()=>{}); }catch(e){}
-    }
+    /* 3) La nube va después y SIN frenar la pantalla. Ya no se reescribe el
+       documento a ciegas: se fusiona dentro de una transacción. Si no hay
+       señal queda en cola y sube solo cuando vuelva. */
+    if(nubeActiva()){ marcarPendiente(true); subirFusionado(); }
   },
   subscribe(cb){
-    if(USE_FIRESTORE && _docRef){ _docRef.onSnapshot(d=>{
-      if(d.exists && !d.metadata.hasPendingWrites && d.data().db){
-        localSave(d.data().db);          /* la copia del celular no se queda atrás */
-        cb(d.data().db, d.data().rev||0);
-      }
-    }); }
+    if(!nubeActiva()) return;
+    _docRef.onSnapshot(d=>{
+      if(!d.exists || d.metadata.hasPendingWrites) return;
+      const dat=d.data(); const remoto=(dat&&dat.db)?dat.db:null;
+      if(!remoto) return;
+      let fusion; try{ fusion=fusionar(DB, remoto); }catch(e){ return; }
+      const antes=firmaCorta(DB);
+      if(firmaCorta(fusion)===antes) return;      /* no trae nada nuevo */
+      DB=fusion; _huella=null; sellar(DB); localSave(DB);
+      /* Si acá había algo que allá falta, se empuja de vuelta */
+      if(firmaCorta(DB)!==firmaCorta(remoto)) subirFusionado();
+      cb(DB, dat.rev||0);
+    });
   }
 };
 
@@ -1960,6 +2204,7 @@ function panelNegocio(){
       <button class="btn btn-line" onclick="App.toggleInsumos()">${usaInsumos()?'Apagar y simplificar la app':'Activar materia prima y recetas'}</button>
     </div>
     <div class="seclabel">Seguridad</div>
+    ${tarjetaNube()}
     <div class="card"><h3>Tu usuario y tu clave</h3>
       <p class="hint" style="margin:0 0 12px">Cambia el <b>nombre con el que entras</b> y tu clave de 4 dígitos. Para los trabajadores: Ajustes → Empleados → Nombre y clave.</p>
       <button class="btn btn-line" onclick="App.cambiarUsuario()">Cambiar mi usuario y mi clave</button>
@@ -2066,6 +2311,34 @@ function panelEmpleados(){
       <div><div class="lab">${u.nombre}</div><div class="sub">${u.rol==='admin'?'Administrador':'Trabajador'} · clave ${S.verPin===u.id?u.pin:'••••'} <button class="btn-ojo" onclick="event.stopPropagation();App.verPin('${u.id}')">${S.verPin===u.id?'ocultar':'ver'}</button></div></div>
       <div style="display:flex;gap:8px"><button class="btn btn-sm btn-line" onclick="App.editEmp('${u.id}')">Nombre y clave</button>${u.rol!=='admin'?`<button class="btn btn-sm btn-line" onclick="App.delEmp('${u.id}')">Quitar</button>`:''}</div></div></div>`).join('')}
     <button class="btn btn-ghost" onclick="App.addEmp()">${svg('plus')} Agregar trabajador</button>`;
+}
+
+/* ---------------------- Llave del negocio (nube) ---------------------- */
+function tarjetaNube(){
+  if(!USE_FIRESTORE) return '';
+  if(nubeActiva()){
+    return `<div class="card"><h3>Copia en la nube</h3>
+      <div class="row" style="border:none;padding:0 0 12px">
+        <div style="min-width:0"><div class="lab">Conectado</div>
+        <div class="sub">${_correoNube||'este negocio'}</div></div>
+        <span class="pill v">Protegido</span>
+      </div>
+      <p class="hint" style="margin:0 0 12px">Tus datos viajan a un espacio privado de <b>este negocio</b>. Nadie más puede abrirlos, ni siquiera otro cliente de la app.</p>
+      <button class="btn btn-line" onclick="App.nubeSalir()">Desconectar este celular</button>
+    </div>`;
+  }
+  const abierto=!!S.nubeForm;
+  return `<div class="card" style="border-color:var(--warn-line);background:var(--warn-bg)">
+    <h3 style="color:var(--warn)">Este celular no está en la nube</h3>
+    <p class="hint" style="margin:0 0 12px">Todo se está guardando <b>solo en este teléfono</b>. Si se pierde o se daña, se pierde la información. Conéctalo con la llave del negocio para que quede respaldado y sincronizado con los otros celulares.</p>
+    ${abierto?`
+      <div class="authf" style="margin-bottom:10px"><input id="nb_mail" type="email" placeholder="Correo del negocio" autocomplete="username" autocapitalize="none" autocorrect="off" value="${(DB.nube&&DB.nube.correo)||''}"></div>
+      <div class="authf" style="margin-bottom:12px"><input id="nb_pass" type="password" placeholder="Contraseña del negocio" autocomplete="current-password"></div>
+      <button class="btn btn-primary" onclick="App.nubeGuardar()">Conectar</button>
+      <div style="height:10px"></div>
+      <button class="btn btn-ghost btn-sm" onclick="App.nubeAbrir(false)">Ahora no</button>
+    `:`<button class="btn btn-primary" onclick="App.nubeAbrir(true)">Conectar a la nube</button>`}
+  </div>`;
 }
 
 /* --------------------------- Helpers de vista --------------------------- */
@@ -2187,9 +2460,15 @@ const App = {
   async ventaNuevoCliente(){
     const g=i=>(document.getElementById(i)||{}).value;
     S.ctx.ventaTmp={prodId:g('v_prod'),qty:g('v_qty'),precio:g('v_precio'),monto:g('v_monto'),concepto:g('v_conc'),clienteId:''};
-    const nombre=prompt('Nombre del cliente:'); if(!nombre) return;
-    const contacto=prompt('Contacto (opcional):')||'';
-    const nc={id:uid(),nombre:nombre.trim(),contacto}; DB.clientes.push(nc);
+    /* Un solo cuadro: Chrome en el celular suprime el segundo y el cliente
+       terminaba guardado sin contacto, sin que nadie se diera cuenta. */
+    const linea=prompt('NUEVO CLIENTE\n\nEscribe el nombre. Si quieres, agrega el teléfono después de una coma.\n\nEjemplo:  Tienda La Esquina, 310 555 1122');
+    if(!linea || !linea.trim()) return;
+    const partes=linea.split(',');
+    const nombre=(partes.shift()||'').trim();
+    const contacto=partes.join(',').trim();
+    if(!nombre) return;
+    const nc={id:uid(),nombre,contacto}; DB.clientes.push(nc);
     S.ctx.ventaTmp.clienteId=nc.id;
     await persist(); render(); toast('Cliente creado');
   },
@@ -2373,8 +2652,7 @@ const App = {
     if(!confirm('DESHACER ESTE COBRO\n\n'+p.cliente+' · '+fmtFecha(p.fecha)+'\n'
       +'Plata: '+$(p.plata)+(p.devuelto>0?'\nProducto devuelto: '+$(p.devuelto):'')+'\n\n'
       +'La deuda vuelve a quedar abierta'+(p.devuelto>0?' y el producto devuelto vuelve a quedar pendiente':'')
-      +'.\n\n¿Seguro?')) return;
-    if(!confirm('Confírmame otra vez: se va a borrar este cobro de '+$(p.cubierto)+'.')) return;
+      +'.\n\nSe borra el cobro de '+$(p.cubierto)+'. Esto NO se puede deshacer.\n\n¿Seguro?')) return;
 
     /* 1) Quitar los abonos que llevan este recibo */
     (DB.fiados||[]).forEach(f=>{
@@ -2512,8 +2790,8 @@ const App = {
       +'Copia del '+fmtFecha(p.fecha)+' · '+p.motivo+'\n'
       +'Días guardados: '+movCopia+' (ahora tienes '+movAhora+')\n'
       +'Fiados: '+((p.db.fiados||[]).length)+'\n\n'
-      +'Todo lo registrado DESPUÉS de esa copia se pierde.\n\n¿Seguro?')) return;
-    if(!confirm('Confírmame otra vez: la app vuelve al estado del '+fmtFecha(p.fecha)+'.')) return;
+      +'Todo lo registrado DESPUÉS de esa copia se pierde.\n'
+      +'La app vuelve al estado del '+fmtFecha(p.fecha)+'.\n\n¿Seguro?')) return;
     const lic=DB.licencia, pin=DB.creatorPin;
     DB=p.db; DB.licencia=lic; DB.creatorPin=pin;   /* licencia y PIN nunca viajan */
     sanea(); await persist(); render();
@@ -2606,10 +2884,9 @@ const App = {
     if(f) DB.licencia.vence=f.value||null;
     DB.licencia.activo=true;
     await persist();
-    if(!USE_FIRESTORE){ render(); toast('Guardado en este equipo'); return; }
+    if(!nubeActiva()){ render(); toast('Guardado en este equipo'); return; }
     try{
-      await firebase.firestore().collection('app').doc('licencia')
-        .set({activo:true, vence:DB.licencia.vence||null, actualizado:Date.now()},{merge:true});
+      await refLicencia().set({activo:true, vence:DB.licencia.vence||null, actualizado:Date.now()},{merge:true});
       render(); toast('Aplicado en la nube');
     }catch(e){
       render(); toast('Las reglas no permiten cambiar la licencia desde la app. Cambiala en la consola de Firebase: app > licencia > vence');
@@ -2623,7 +2900,7 @@ const App = {
   },
   async bloquear(){
     DB.licencia.activo=false; await persist();
-    if(USE_FIRESTORE){ try{ await firebase.firestore().collection('app').doc('licencia')
+    if(nubeActiva()){ try{ await refLicencia()
       .set({activo:false, actualizado:Date.now()},{merge:true}); toast('Bloqueada en la nube'); }
       catch(e){ toast('Bloqueada aqui, pero no en la nube'); } }
     else toast('App bloqueada');
@@ -2658,15 +2935,15 @@ const App = {
       +'Se van '+viejos.length+' día(s) con sus ventas y gastos.\n\n'
       +(fiadosVivos?('OJO: quedan '+fiadosVivos+' fiado(s) sin cobrar que se quedarían SIN su venta.\n'):'')
       +(conAbonos?('Y '+conAbonos+' con abonos ya recibidos, que seguirían contando en Balance.\n'):'')
-      +'\nEsto es para limpiar pruebas, no para usar con datos reales.\n\n¿Seguro?')) return;
-    if(!confirm('Escribe mentalmente: esto NO se puede deshacer desde la app.\n\nSe guardará una copia de emergencia por si acaso.\n\n¿Confirmas?')) return;
+      +'\nEsto es para limpiar pruebas, no para usar con datos reales.\n'
+      +'NO se puede deshacer desde la app, pero se guarda una copia de emergencia.\n\n¿Seguro?')) return;
     puntoDeRestauracion('Borrar días anteriores');
     DB.dias=DB.dias.filter(d=>d.fecha===today());
     await persist(); toast('Días anteriores borrados · hay copia de emergencia en Mi negocio'); render();
   },
   async resetDatos(){
-    if(!confirm('Esto borra TODO: productos, ventas, historial, clientes. ¿Seguro?')) return;
-    if(prompt('Escribe BORRAR para confirmar:')!=='BORRAR'){ toast('Cancelado'); return; }
+    const r=prompt('BORRAR TODO\n\nSe van productos, ventas, historial, clientes: TODO.\nEsto no se puede deshacer.\n\nSi estás seguro, escribe BORRAR:');
+    if((r||'').trim().toUpperCase()!=='BORRAR'){ toast('Cancelado'); return; }
     const lic=DB.licencia, cpin=DB.creatorPin;
     DB=seed(); DB.licencia=lic; DB.creatorPin=cpin;
     await persist(); toast('Datos reiniciados'); render();
@@ -2765,6 +3042,20 @@ const App = {
     if(!confirm('¿Quitar tu logo y volver al de la app?')) return;
     const n=Object.assign({},DB.negocio); delete n.logo; DB.negocio=n;
     await persist(); toast('Logo quitado'); render();
+  },
+  nubeAbrir(v){ S.nubeForm=!!v; render(); },
+  async nubeGuardar(){
+    const m=document.getElementById('nb_mail'), c=document.getElementById('nb_pass');
+    const correo=(m?m.value:'').trim(), clave=(c?c.value:'');
+    if(!correo||!clave){ toast('Escribe el correo y la contraseña del negocio'); return; }
+    toast('Conectando…');
+    const r=await nubeEntrar(correo, clave);
+    if(r.ok){ S.nubeForm=false; render(); toast('Negocio conectado y protegido'); }
+    else { if(c) c.value=''; toast(r.msg); }
+  },
+  async nubeSalir(){
+    if(!confirm('DESCONECTAR ESTE CELULAR\n\nLos datos siguen aquí, pero dejan de subir a la nube y de sincronizarse con los otros celulares.\n\n¿Seguro?')) return;
+    await nubeSalir(); render(); toast('Celular desconectado de la nube');
   },
   cambiarUsuario(){
     const yo = (S.user && DB.usuarios.find(u=>u.id===S.user.id)) || DB.usuarios.find(u=>u.rol==='admin');
@@ -2976,8 +3267,8 @@ const App = {
       const recibos=[...new Set(fiadosLig.flatMap(f=>(f.abonos||[]).map(a=>a.recibo).filter(Boolean)))];
       if(!confirm('CUIDADO\n\nEste cliente ya abonó '+$(abonado)+' sobre esta venta'
         +(recibos.length?' (recibo '+recibos.join(', ')+')':'')
-        +'.\n\nSi la borras, esa plata desaparece del Balance y el recibo que el cliente tiene queda sin respaldo.\n\n¿Aun así quieres borrarla?')) return;
-      if(!confirm('Confírmame otra vez: se van a borrar '+$(abonado)+' ya recibidos.')) return;
+        +'.\n\nSi la borras, esa plata desaparece del Balance y el recibo que el cliente tiene queda sin respaldo.\n'
+        +'Se van a borrar '+$(abonado)+' ya recibidos.\n\n¿Aun así quieres borrarla?')) return;
     } else {
       if(!confirm('¿Quitar este registro del día?')) return;
     }
@@ -3021,8 +3312,8 @@ const App = {
       if(!confirm('RESTAURAR RESPALDO\n\n'
         +'Del '+(paq.creado?paq.creado.slice(0,10):'fecha desconocida')+'\n'
         +'Trae: '+(nueva.productos||[]).length+' productos, '+(nueva.clientes||[]).length+' clientes, '+nV+' ventas.\n\n'
-        +'Lo que tienes ahora ('+aV+' ventas) se reemplaza por completo.\n\n¿Seguro?')) return;
-      if(!confirm('Última confirmación: se reemplaza TODA la información actual.')) return;
+        +'Lo que tienes ahora ('+aV+' ventas) se reemplaza por completo.\n'
+        +'TODA la información actual se pierde.\n\n¿Seguro?')) return;
       const pinActual=DB.creatorPin, licActual=DB.licencia;
       DB=nueva;
       DB.creatorPin=pinActual;                      /* el PIN y la licencia no se restauran */
@@ -3124,7 +3415,7 @@ document.addEventListener('input',e=>{ if(e.target.id==='f_precio') e.target.dat
    3) Anti-retroceso de reloj: DB.licencia.maxDate.
    Acceso al panel oculto: toca el logo (login/bloqueo) o la marca de arriba
    5 veces y entra con el PIN de creador (DB.creatorPin, por defecto 2468). */
-const APP_VER = 'v30';
+const APP_VER = 'v33';
 const GRACIA_DIAS = 7;
 /* Cuenta de soporte del creador. No vive en DB.usuarios: el cliente no la ve,
    no la puede editar ni borrar, y sobrevive aunque cambie todas las claves.
@@ -3156,9 +3447,9 @@ async function checkLicense(){
   const L=DB.licencia, hoy=today();
   if(L.maxDate && hoy < L.maxDate) return {locked:true, reason:'La fecha del dispositivo fue alterada. Contacta al proveedor.'};
   if(!L.maxDate || hoy > L.maxDate) L.maxDate=hoy;
-  if(USE_FIRESTORE){
+  if(nubeActiva()){
     try{
-      const snap=await firebase.firestore().collection('app').doc('licencia').get();
+      const snap=await refLicencia().get();
       L.lastCheck=Date.now();
       if(snap.exists){ const j=snap.data();
         if(j.activo===false){ L.activo=false; await persist(); return {locked:true, reason:'Aplicacion suspendida. Contacta al proveedor.'}; }
@@ -3168,6 +3459,11 @@ async function checkLicense(){
       const dias=L.lastCheck?(Date.now()-L.lastCheck)/86400000:0;
       if(L.lastCheck && dias>GRACIA_DIAS) return {locked:true, reason:'No se pudo validar la licencia. Conectate a internet.'};
     }
+  } else if(DB.nube && DB.nube.uid){
+    /* Este negocio YA estuvo con llave: desconectarse no sirve para esquivar
+       la licencia, corre el mismo periodo de gracia. */
+    const dias=L.lastCheck?(Date.now()-L.lastCheck)/86400000:0;
+    if(L.lastCheck && dias>GRACIA_DIAS) return {locked:true, reason:'Vuelve a conectar el negocio a la nube para validar la licencia.'};
   } else if(L.url){
     try{
       const sep=L.url.includes('?')?'&':'?';
@@ -3329,8 +3625,8 @@ function sanea(){
   DB.papelera=DB.papelera||[];
   DB.retornos=DB.retornos||[];
   DB.pagos=DB.pagos||[];
-  reconstruirPagos();
-  if(!DB.pagosReconstruidos){ reconstruirPagos(); DB.pagosReconstruidos=true; }
+  reconstruirPagos();          /* corría dos veces por arranque, sin necesidad */
+  DB.pagosReconstruidos=true;
   // ---- Migración al libro por fechas (corre una sola vez) ----
   if(!DB.dias){
     DB.dias=[];
@@ -3348,6 +3644,7 @@ function sanea(){
   DB.productos.forEach(p=>{ if(!p.receta) p.receta=[]; });
   DB.licencia=DB.licencia||{activo:true,vence:null,url:'',lastCheck:0,maxDate:''};
   DB.creatorPin=DB.creatorPin||'2468';
+  DB._tumbas=Array.isArray(DB._tumbas)?DB._tumbas:[];
 }
 /* ---- Modo sin internet + aviso de version nueva ---- */
 function registrarSW(){
@@ -3375,7 +3672,7 @@ function avisoVersion(sw){
 }
 function vigilarConexion(){
   const pinta=()=>{ document.body.classList.toggle('offline',!navigator.onLine); };
-  window.addEventListener('online',()=>{ pinta(); toast('Volvió el internet — sincronizando'); });
+  window.addEventListener('online',()=>{ pinta(); toast('Volvió el internet — sincronizando'); reintentarCola(); });
   window.addEventListener('offline',()=>{ pinta(); toast('Sin internet — se sigue guardando en el celular'); });
   pinta();
 }
@@ -3386,26 +3683,20 @@ function vigilarConexion(){
   DB = await Store.load();
   if(!DB){
     /* Última red de seguridad antes de sembrar: si el celular tiene algo, se usa. */
-    const local = localLoad();
+    const local = await localLoad();   /* faltaba el await: DB quedaba siendo una Promise */
     if(local){ DB=local; }
     else { DB=seed(); await persist(); }
   }
   sanea();
+  /* Foto de referencia: a partir de aquí sabemos qué cambió de verdad */
+  _huella=null; sellar(DB);
+  marcarPendiente(haySincola());
+  setInterval(reintentarCola, 45000);
 
   const lic=await checkLicense();
   if(lic.locked){ S.locked=true; S.lockReason=lic.reason; }
   render();
-  Store.subscribe((remote,rev)=>{
-    if(rev>_revLocal) _revLocal=rev;
-    const editando = S.view==='form' || S.creator;
-    DB=remote; sanea();
-    if(editando){
-      /* Otro celular guardó mientras este escribía: avisar, no borrar lo tecleado. */
-      toast('Otro dispositivo registró algo. Guarda lo tuyo para no perderlo.');
-      return;
-    }
-    render();
-  });
+  arrancarNube();
 })();
 </script>
 </body>

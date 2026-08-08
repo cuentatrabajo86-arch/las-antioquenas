@@ -3,12 +3,12 @@
    Hace que la app abra sin internet y avisa cuando hay versión nueva.
 
    IMPORTANTE: cada vez que subas un index.html nuevo, súbele el
-   número a VERSION (v1 -> v2 -> v3...). Eso obliga a todos los
+   número a VERSION (v33 -> v34 -> v35...). Eso obliga a todos los
    celulares a bajar la versión nueva. Si no lo cambias, algunos
    clientes seguirán viendo la app vieja.
    =========================================================== */
 
-const VERSION = 'nexbit-v30';
+const VERSION = 'nexbit-v33';
 const SHELL   = VERSION + '-shell';   // la app
 const EXTERNO = VERSION + '-externo'; // fuentes y librerías
 
@@ -30,25 +30,36 @@ const CDN = [
   'https://fonts.gstatic.com'
 ];
 
-/* Firestore NUNCA se cachea: siempre debe hablar con el servidor.
-   Si no hay señal, el propio Firebase guarda los cambios y los sube después. */
+/* Nunca se cachea: siempre debe hablar con el servidor.
+   Firestore guarda solo los cambios y los sube después si no hay señal.
+   Los de identitytoolkit y securetoken son el login del negocio: si se
+   cachearan, el celular podría quedarse con una sesión vieja o vencida. */
 const NUNCA_CACHE = [
   'firestore.googleapis.com',
   'firebaseinstallations.googleapis.com',
+  'identitytoolkit.googleapis.com',
+  'securetoken.googleapis.com',
+  'firebase.googleapis.com',
   'google-analytics.com'
 ];
 
-const esCDN     = url => CDN.some(d => url.startsWith(d));
+const esCDN       = url => CDN.some(d => url.startsWith(d));
 const esProhibido = url => NUNCA_CACHE.some(d => url.indexOf(d) !== -1);
 
-/* ---------- INSTALAR: guardar la app ---------- */
+/* ---------- INSTALAR: guardar la app ----------
+   Cada archivo se guarda por separado. Antes iba con addAll, que es
+   todo-o-nada: si faltaba un solo icono, NO se guardaba nada y la app
+   se quedaba sin modo offline sin avisar. */
 self.addEventListener('install', ev => {
   ev.waitUntil(
-    caches.open(SHELL)
-      .then(c => c.addAll(ARCHIVOS))
-      .catch(() => {})          // si falla algo, no bloquea la instalación
-      .then(() => self.skipWaiting())
+    caches.open(SHELL).then(c =>
+      Promise.all(ARCHIVOS.map(a => c.add(a).catch(() => {})))
+    ).catch(() => {})
   );
+  /* OJO: aquí NO va skipWaiting(). La app muestra el aviso
+     "Hay una versión nueva" y el usuario decide cuándo actualizar.
+     Si se salta la espera, la app se recarga sola y el vendedor
+     pierde lo que esté escribiendo. */
 });
 
 /* ---------- ACTIVAR: borrar versiones viejas ---------- */
@@ -69,7 +80,7 @@ self.addEventListener('fetch', ev => {
   if (req.method !== 'GET') return;
 
   const url = req.url;
-  if (esProhibido(url)) return;                    // Firestore pasa derecho
+  if (esProhibido(url)) return;                    // login y Firestore pasan derecho
   if (!url.startsWith('http')) return;
 
   /* La app: primero internet (para que las actualizaciones lleguen de una),
@@ -82,8 +93,14 @@ self.addEventListener('fetch', ev => {
     ev.respondWith(
       fetch(req)
         .then(res => {
-          const copia = res.clone();
-          caches.open(SHELL).then(c => c.put('./index.html', copia)).catch(() => {});
+          /* Solo se guarda si vino bien de verdad. Antes se guardaba
+             cualquier respuesta: si GitHub contestaba un 404 mientras
+             subías archivos, ese 404 quedaba grabado COMO la app y el
+             cliente abría una pantalla en blanco hasta la próxima señal. */
+          if (res && res.ok && res.status === 200 && !res.redirected) {
+            const copia = res.clone();
+            caches.open(SHELL).then(c => c.put('./index.html', copia)).catch(() => {});
+          }
           return res;
         })
         .catch(() =>
@@ -117,7 +134,8 @@ self.addEventListener('fetch', ev => {
   }
 });
 
-/* ---------- Permite que la app fuerce la actualización ---------- */
+/* ---------- Permite que la app fuerce la actualización ----------
+   Esto se dispara cuando el usuario toca "Actualizar" en el aviso. */
 self.addEventListener('message', ev => {
   if (ev.data === 'ACTUALIZAR_YA') self.skipWaiting();
 });
