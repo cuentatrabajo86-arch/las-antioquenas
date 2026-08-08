@@ -476,26 +476,97 @@ async function initFirestore(){
   }
 }
 async function localLoad(){ try{ const t=localStorage.getItem(LKEY); return t? JSON.parse(t):null; }catch(e){ return null; } }
-async function localSave(db){
-  try{ localStorage.setItem(LKEY, JSON.stringify(db)); }
+/* Copia de emergencia antes de una operación destructiva. Vive aparte de la
+   base normal, así que ni un borrado ni una restauración se la llevan. */
+const SKEY = LKEY + '_seguro';
+function puntoDeRestauracion(motivo){
+  try{
+    localStorage.setItem(SKEY, JSON.stringify({
+      motivo, fecha:today(), ts:Date.now(),
+      usuario:(S.user&&S.user.nombre)||'', db:DB
+    }));
+    return true;
+  }catch(e){ return false; }
+}
+function leerPuntoDeRestauracion(){
+  try{ const t=localStorage.getItem(SKEY); return t? JSON.parse(t):null; }catch(e){ return null; }
+}
+/* Busca datos que quedaron cojos (típicamente por borrar días y dejar los
+   fiados vivos). Solo REPORTA; limpiar es decisión del dueño. */
+function revisarDatos(){
+  const fechas=new Set((DB.dias||[]).map(d=>d.fecha));
+  const problemas=[];
+  const fiadosHuerfanos=(DB.fiados||[]).filter(f=>f.fecha && !fechas.has(f.fecha));
+  const conAbonos=fiadosHuerfanos.filter(f=>(f.abonos||[]).length);
+  if(fiadosHuerfanos.length) problemas.push({
+    clave:'fiadosHuerfanos', n:fiadosHuerfanos.length,
+    titulo:'Fiados sin su venta',
+    detalle:'Quedaron '+fiadosHuerfanos.length+' fiado(s) cuya venta ya no existe'
+      +(conAbonos.length?', y '+conAbonos.length+' con abonos que siguen contando como ingreso en Balance':'')
+      +'. Suele pasar al borrar días anteriores.',
+    monto:fiadosHuerfanos.reduce((t,f)=>t+saldoFiado(f),0)
+  });
+  const idsCli=new Set((DB.clientes||[]).map(c=>c.id));
+  const sinCliente=(DB.fiados||[]).filter(f=>f.clienteId && !idsCli.has(f.clienteId));
+  if(sinCliente.length) problemas.push({clave:'fiadosSinCliente', n:sinCliente.length,
+    titulo:'Fiados de un cliente borrado',
+    detalle:'Hay '+sinCliente.length+' fiado(s) de clientes que ya no están en el catálogo.',
+    monto:sinCliente.reduce((t,f)=>t+saldoFiado(f),0)});
+  const retSinCli=(DB.retornos||[]).filter(r=>!r.aplicado && r.clienteId && !idsCli.has(r.clienteId));
+  if(retSinCli.length) problemas.push({clave:'retornosHuerfanos', n:retSinCli.length,
+    titulo:'Devoluciones de un cliente borrado',
+    detalle:'Hay '+retSinCli.length+' devolución(es) pendientes de clientes que ya no existen.',
+    monto:retSinCli.reduce((t,r)=>t+valorRetorno(r),0)});
+  const idsProd=new Set((DB.productos||[]).map(p=>p.id));
+  const retSinProd=(DB.retornos||[]).filter(r=>!r.aplicado && r.prodId && !idsProd.has(r.prodId));
+  if(retSinProd.length) problemas.push({clave:'retornosSinProducto', n:retSinProd.length,
+    titulo:'Devoluciones de un producto borrado',
+    detalle:'Hay '+retSinProd.length+' devolución(es) de productos que ya no están en el catálogo.',
+    monto:retSinProd.reduce((t,r)=>t+valorRetorno(r),0)});
+  return problemas;
+}
+function localSave(db){
+  try{ localStorage.setItem(LKEY, JSON.stringify(db)); return true; }
   catch(e){
     /* Sin espacio: es mejor avisar que perder el registro en silencio */
-    try{ toast('No se pudo guardar en el celular (sin espacio). Libera espacio o revisa tu conexión.'); }catch(e2){}
+    try{ toast('No se pudo guardar en el celular. Libera espacio y vuelve a intentar.'); }catch(e2){}
     console.error('localSave fallo:', e);
+    return false;
   }
 }
 const Store = {
   async load(){
-    if(USE_FIRESTORE && _docRef){ try{ const d=await _docRef.get(); return (d.exists && d.data().db)? d.data().db : null; }catch(e){ return localLoad(); } }
+    /* Si la nube contesta vacío NO se devuelve null a secas: antes eso hacía que
+       el arranque creara datos de demostración y los guardara ENCIMA de los del
+       cliente. Siempre se cae a la copia del celular. */
+    if(USE_FIRESTORE && _docRef){
+      try{
+        const d=await _docRef.get();
+        if(d.exists && d.data().db) return d.data().db;
+      }catch(e){}
+      return localLoad();
+    }
     return localLoad();
   },
   async save(db){
     _revLocal++;
-    if(USE_FIRESTORE && _docRef){ try{ await _docRef.set({db, rev:_revLocal, updatedAt:Date.now()}); return; }catch(e){} }
-    return localSave(db);
+    /* 1) SIEMPRE Y PRIMERO el celular: es instantáneo y no depende de la señal.
+       Antes se esperaba a que la nube contestara, y sin señal esa espera no
+       terminaba nunca: la pantalla se quedaba pegada después de guardar. */
+    localSave(db);
+    /* 2) La nube va después y SIN frenar la pantalla. Si no hay señal, Firestore
+       la deja en su cola y la sube solo cuando vuelva. */
+    if(USE_FIRESTORE && _docRef){
+      try{ _docRef.set({db, rev:_revLocal, updatedAt:Date.now()}).catch(()=>{}); }catch(e){}
+    }
   },
   subscribe(cb){
-    if(USE_FIRESTORE && _docRef){ _docRef.onSnapshot(d=>{ if(d.exists && !d.metadata.hasPendingWrites && d.data().db) cb(d.data().db, d.data().rev||0); }); }
+    if(USE_FIRESTORE && _docRef){ _docRef.onSnapshot(d=>{
+      if(d.exists && !d.metadata.hasPendingWrites && d.data().db){
+        localSave(d.data().db);          /* la copia del celular no se queda atrás */
+        cb(d.data().db, d.data().rev||0);
+      }
+    }); }
   }
 };
 
@@ -614,6 +685,9 @@ function precioAplicable(prodId, qty){
   const precio = usaMayor ? p.mayoreo : (p.menudeo||p.mayoreo||0);
   return {precio, tipo: usaMayor?'mayoreo':'menudeo', umbral, bajoCosto: (p.costo||0)>0 && precio < p.costo};
 }
+/* Género de la unidad, para que no salga "¿Cuántas galones?" */
+const UNI_MASC=['gramo','litro','metro','paquete','bulto','galón','servicio','kg','ml','g'];
+function uniCuantos(u){ return UNI_MASC.includes(u||'') ? 'Cuántos' : 'Cuántas'; }
 function uniPlural(u){ u=u||'unidad';
   if(u==='kg'||u==='ml'||u==='g') return u;      /* abreviaturas no se pluralizan */
   if(/ón$/.test(u)) return u.slice(0,-2)+'ones'; /* galón -> galones */
@@ -1167,7 +1241,7 @@ function vForm(){
         <label class="fld"><span>¿Qué producto te devolvió?</span>
           <select id="r_prod" onchange="App.retornoCalc(1)">${activos.map(p=>`<option value="${p.id}" ${pid===p.id?'selected':''}>${p.nombre}</option>`).join('')}</select></label>
         <div style="display:flex;gap:10px">
-          <label class="fld" style="flex:1"><span>¿Cuántas?</span><input type="number" min="1" inputmode="numeric" id="r_qty" value="${tmp.qty||1}" oninput="App.retornoCalc()"></label>
+          <label class="fld" style="flex:1"><span id="r_qtylab">¿${pid?uniCuantos(prod(pid).unidad):'Cuántas'} ${pid?uniPlural(prod(pid).unidad):'unidades'}?</span><input type="number" min="1" inputmode="numeric" id="r_qty" value="${tmp.qty||1}" oninput="App.retornoCalc()"></label>
           <label class="fld" style="flex:1"><span>Precio que pagó</span><input type="number" min="0" inputmode="numeric" id="r_precio" value="${tmp.precio||''}" oninput="this.dataset.touched=1;App.retornoCalc()"></label>
         </div>
         <label class="fld"><span>¿Qué día?</span><input type="date" id="r_fecha" value="${tmp.fecha||today()}"></label>
@@ -1301,7 +1375,7 @@ function vForm(){
 
         <div id="v_gprod" style="display:${pid?'block':'none'}">
           <div style="display:flex;gap:10px">
-            <label class="fld" style="flex:1"><span>Cantidad</span><input type="number" min="1" inputmode="numeric" id="v_qty" value="${tmp.qty||1}" oninput="App.ventaCalc(1)"></label>
+            <label class="fld" style="flex:1"><span id="v_qtylab">Cantidad${pid?' ('+uniPlural(prod(pid).unidad)+')':''}</span><input type="number" min="1" inputmode="numeric" id="v_qty" value="${tmp.qty||1}" oninput="App.ventaCalc(1)"></label>
             <label class="fld" style="flex:1"><span>Precio</span><input type="number" min="0" inputmode="numeric" id="v_precio" value="${tmp.precio||''}" oninput="this.dataset.touched=1;App.ventaCalc()"></label>
           </div>
         </div>
@@ -1446,6 +1520,9 @@ function vForm(){
 }
 
 let _espCierre=0, _lastPago='tr';/* -------------------------------- INFORME -------------------------------- */
+function devolucionesDelDia(f){
+  return (DB.retornos||[]).filter(r=>r.aplicado && r.aplicadoFecha===f);
+}
 function vInforme(){
   const j = S.ctx.jornada;
   if(!j) return noDia();
@@ -1504,6 +1581,16 @@ function vInforme(){
       ${ranking.map(r=>`<div class="row"><div><div class="lab">${r.nombre}</div><div class="sub">${r.merma?`${r.merma} dañadas`:''}</div></div>
         <div style="text-align:right"><div class="val">${r.vend} vend.</div><div class="sub">${$(r.gan)} gcia.</div></div></div>`).join('')}
     </div>
+    ${(()=>{const dv=devolucionesDelDia(j.fecha); if(!dv.length) return '';
+      const tot=dv.reduce((t,r)=>t+valorRetorno(r),0);
+      return `<div class="card"><h3>Producto que devolvieron los clientes</h3>
+        <div class="hint" style="margin:0 0 12px">Se les descontó de lo que debían. No es un gasto.</div>
+        ${dv.map(r=>`<div class="row"><div style="min-width:0">
+          <div class="lab">${r.qty} × ${prod(r.prodId).nombre}</div>
+          <div class="sub">${cliente(r.clienteId).nombre} · ${$(r.precio)} c/u${r.recibo?' · '+r.recibo:''}</div></div>
+          <div class="val" style="color:var(--warn)">${$(valorRetorno(r))}</div></div>`).join('')}
+        <div class="row" style="border-bottom:none"><div class="lab">Total devuelto</div>
+          <div class="val" style="color:var(--warn)">${$(tot)}</div></div></div>`;})()}
     ${editar}${share}${back}`;
 }
 function generarFactura(o){
@@ -1603,7 +1690,9 @@ function vCobros(){
     .filter(cid=>!porCli[cid]);
   const ua=S.ctx.ultimoAbono;
 
+  const _qc=(S.ctx.qc||'').trim().toLowerCase();
   const bloques=Object.entries(porCli)
+    .filter(([cid])=> !_qc || (cliente(cid).nombre||'').toLowerCase().includes(_qc))
     .sort((a,b)=> b[1].reduce((s,f)=>s+saldoFiado(f),0) - a[1].reduce((s,f)=>s+saldoFiado(f),0))
     .map(([cid,arr])=>{
       const saldo=arr.reduce((s,f)=>s+saldoFiado(f),0);
@@ -1628,7 +1717,10 @@ function vCobros(){
           <div class="sub">se le descuenta cuando te pague</div></div></div>`:'';})()}
         <button class="btn btn-verde" onclick="App.cobrarCliente('${cid}')">Registrar un pago</button>
         <div style="height:8px"></div>
-        <button class="btn btn-line btn-sm" onclick="App.anotarRetorno('${cid}')">Anotar producto devuelto</button>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-line btn-sm" style="flex:1" onclick="App.anotarRetorno('${cid}')">Producto devuelto</button>
+          <button class="btn btn-line btn-sm" style="flex:1" onclick="App.estadoCuenta('${cid}')">Enviar estado de cuenta</button>
+        </div>
         <div class="hint" style="margin:8px 0 12px">Se descuenta empezando por lo más viejo que te debe.</div>
         <div class="seclabel" style="margin:0 0 6px">Lo que te debe, venta por venta</div>
         ${orden.map(f=>{
@@ -1669,6 +1761,10 @@ function vCobros(){
       </div>
       <button class="btn btn-line btn-sm" onclick="App.anotarRetorno('${cid}')">Ver o anotar devoluciones</button>
     </div>`).join(''):''}
+    ${Object.keys(porCli).length>=6?`<div class="card" style="padding:14px 16px">
+      <label class="fld" style="margin:0"><span>Buscar cliente</span>
+        <input type="text" id="b_q" value="${(S.ctx.qc||'').replace(/"/g,'&quot;')}" placeholder="Escribe un nombre" oninput="App.buscarCliente(this.value)"></label>
+    </div>`:''}
     ${abiertos.length? `<div class="statgrid">
         <div class="stat neg"><b>${$(total)}</b><span>Te deben en total</span></div>
         <div class="stat"><b>${Object.keys(porCli).length}</b><span>${Object.keys(porCli).length===1?'Cliente te debe':'Clientes te deben'}</span></div>
@@ -1868,6 +1964,23 @@ function panelNegocio(){
       <p class="hint" style="margin:0 0 12px">Cambia el <b>nombre con el que entras</b> y tu clave de 4 dígitos. Para los trabajadores: Ajustes → Empleados → Nombre y clave.</p>
       <button class="btn btn-line" onclick="App.cambiarUsuario()">Cambiar mi usuario y mi clave</button>
     </div>
+    ${(()=>{const probs=revisarDatos(), punto=leerPuntoDeRestauracion();
+      if(!probs.length && !punto) return '';
+      return `<div class="seclabel">Salud de los datos</div>
+      ${probs.length?`<div class="card" style="border-color:var(--warn-line);background:var(--warn-bg)">
+        <h3 style="color:var(--warn)">Encontré datos incompletos</h3>
+        <div class="hint" style="margin:0 0 12px">Suele pasar al borrar días y dejar los fiados vivos. Por eso Balance puede mostrar plata de ventas que ya no existen.</div>
+        ${probs.map(p=>`<div class="row"><div style="min-width:0">
+          <div class="lab">${p.titulo}</div><div class="sub">${p.detalle}</div></div>
+          <div style="text-align:right;flex:none"><div class="val" style="color:var(--warn)">${$(p.monto)}</div>
+          <button class="btn btn-sm btn-line" style="width:auto;margin-top:6px" onclick="App.limpiarBasura('${p.clave}')">Quitar</button></div></div>`).join('')}
+      </div>`:`<div class="card"><h3>Todo cuadra</h3>
+        <div class="hint" style="margin:0">No hay fiados sin venta ni registros de clientes o productos borrados.</div></div>`}
+      ${punto?`<div class="card">
+        <h3>Copia de emergencia</h3>
+        <div class="hint" style="margin:0 0 12px">Guardada el ${fmtFecha(punto.fecha)} antes de: <b>${punto.motivo}</b>. Tiene ${(punto.db.dias||[]).length} día(s) y ${(punto.db.fiados||[]).length} fiado(s).</div>
+        <button class="btn btn-line" onclick="App.restaurarPunto()">Volver a como estaba antes de esa limpieza</button>
+      </div>`:''}`;})()}
     <div class="seclabel">Copia de seguridad</div>
     <div class="card"><h3>Respaldo completo</h3>
       <p class="hint" style="margin:0 0 12px">Baja un archivo con TODO: ventas, clientes, productos, deudas y fiados. Este sí se puede volver a cargar si algo se pierde. Guárdalo en Drive o mándatelo por WhatsApp.</p>
@@ -2132,6 +2245,10 @@ const App = {
     S.view='form'; S.sub='retorno'; render(); window.scrollTo(0,0);
   },
   retornoCalc(recalcular){
+    try{
+      const lab=document.getElementById('r_qtylab'), sel=document.getElementById('r_prod');
+      if(lab&&sel&&sel.value){ const u=prod(sel.value).unidad; lab.textContent='¿'+uniCuantos(u)+' '+uniPlural(u)+'?'; }
+    }catch(e){}
     const g=i=>document.getElementById(i);
     const pid=(g('r_prod')||{}).value||'';
     const qty=parseInt((g('r_qty')||{}).value)||0;
@@ -2387,6 +2504,62 @@ const App = {
   abrirCreador(){ this.closeDrawer(); S.creator=true; render(); },
   verPin(id){ S.verPin = (S.verPin===id) ? null : id; render();
     clearTimeout(this._tp); this._tp=setTimeout(()=>{ if(S.verPin){ S.verPin=null; render(); } }, 8000); },
+  async restaurarPunto(){
+    const p=leerPuntoDeRestauracion();
+    if(!p){ toast('No hay copia de emergencia guardada'); return; }
+    const movAhora=(DB.dias||[]).length, movCopia=(p.db.dias||[]).length;
+    if(!confirm('VOLVER A COMO ESTABA\n\n'
+      +'Copia del '+fmtFecha(p.fecha)+' · '+p.motivo+'\n'
+      +'Días guardados: '+movCopia+' (ahora tienes '+movAhora+')\n'
+      +'Fiados: '+((p.db.fiados||[]).length)+'\n\n'
+      +'Todo lo registrado DESPUÉS de esa copia se pierde.\n\n¿Seguro?')) return;
+    if(!confirm('Confírmame otra vez: la app vuelve al estado del '+fmtFecha(p.fecha)+'.')) return;
+    const lic=DB.licencia, pin=DB.creatorPin;
+    DB=p.db; DB.licencia=lic; DB.creatorPin=pin;   /* licencia y PIN nunca viajan */
+    sanea(); await persist(); render();
+    toast('Listo — la app volvió al estado del '+fmtFecha(p.fecha));
+  },
+  async limpiarBasura(clave){
+    const p=revisarDatos().find(x=>x.clave===clave); if(!p) return;
+    if(!confirm(p.titulo.toUpperCase()+'\n\n'+p.detalle+'\n\n'
+      +'Se van a quitar '+p.n+' registro(s) por '+$(p.monto)+'.\n'
+      +'Se guarda una copia de emergencia antes.\n\n¿Seguro?')) return;
+    puntoDeRestauracion('Limpiar: '+p.titulo);
+    const fechas=new Set((DB.dias||[]).map(d=>d.fecha));
+    const idsCli=new Set((DB.clientes||[]).map(c=>c.id));
+    const idsProd=new Set((DB.productos||[]).map(x=>x.id));
+    if(clave==='fiadosHuerfanos')     DB.fiados=(DB.fiados||[]).filter(f=>!f.fecha || fechas.has(f.fecha));
+    if(clave==='fiadosSinCliente')    DB.fiados=(DB.fiados||[]).filter(f=>!f.clienteId || idsCli.has(f.clienteId));
+    if(clave==='retornosHuerfanos')   DB.retornos=(DB.retornos||[]).filter(r=>r.aplicado || !r.clienteId || idsCli.has(r.clienteId));
+    if(clave==='retornosSinProducto') DB.retornos=(DB.retornos||[]).filter(r=>r.aplicado || !r.prodId || idsProd.has(r.prodId));
+    await persist(); render(); toast('Limpiado · hay copia de emergencia por si acaso');
+  },
+  estadoCuenta(cid){
+    const abiertos=DB.fiados.filter(f=>f.clienteId===cid && f.estado!=='pagado' && saldoFiado(f)>0)
+      .sort((a,b)=> a.fecha===b.fecha ? ((a.ts||0)-(b.ts||0)) : (a.fecha<b.fecha?-1:1));
+    const deuda=abiertos.reduce((t,f)=>t+saldoFiado(f),0);
+    const dev=valorRetornosPend(cid);
+    if(deuda<1 && dev<1){ toast('Ese cliente no debe nada'); return; }
+    const lineas=abiertos.map(f=>{
+      const ab=(f.abonos||[]).reduce((t,a)=>t+montoAbono(a),0);
+      return [`${fechaCorta(f.fecha)} · ${(f.detalle||'Venta').slice(0,24)}${ab>0?' (abonó '+$(ab)+')':''}`, $(saldoFiado(f))];
+    });
+    if(dev>0){
+      lineas.push(['—— A su favor ——','']);
+      retornosPend(cid).forEach(r=>lineas.push([`${r.qty} × ${prod(r.prodId).nombre} devuelto`, '-'+$(valorRetorno(r))]));
+    }
+    lineas.push(['—— Debe en total ——', $(Math.max(0,deuda-dev))]);
+    generarFactura({cliente:cliente(cid).nombre, telefono:(cliente(cid).contacto||''),
+      lineas, total:Math.max(0,deuda-dev), pago:'Pendiente de pago',
+      fecha:today(), ts:Date.now(), folio:'EC-'+fechaCorta(today()).replace(/\D/g,''),
+      titulo:'ESTADO DE CUENTA'});
+  },
+  buscarCliente(v){
+    S.ctx.qc=v;
+    clearTimeout(this._tbc);
+    this._tbc=setTimeout(()=>{ render(); const i=document.getElementById('b_q');
+      if(i){ i.focus(); i.setSelectionRange(i.value.length,i.value.length); } }, 260);
+  },
   cerrarAviso(){ S.ctx.ultimoAbono=null; render(); },
 
   /* ---- Config CRUD (admin) ---- */
@@ -2461,6 +2634,7 @@ const App = {
     /* Blindaje explicito: estas llaves NO se tocan jamas en este reset. */
     const PROTEGIDAS=['productos','clientes','usuarios','insumos','proveedores','negocio','licencia','creatorPin'];
     const OPERATIVAS=['dias','fiados','compras','cotizaciones','deudas','papelera','retornos','pagos'];
+    puntoDeRestauracion('Borrar todos los movimientos');
     const antes={}; PROTEGIDAS.forEach(k=>antes[k]=JSON.stringify(DB[k]));
     const mov=(DB.dias||[]).reduce((t,d)=>t+d.mayoreo.length+(d.libres||[]).length+d.gastos.length+d.mermas.length+(d.devoluciones||[]).length,0);
     if(!mov && !(DB.fiados||[]).length){ toast('Ya está limpio, no hay movimientos'); return; }
@@ -2473,10 +2647,22 @@ const App = {
     toast('Listo — la app quedó como recién instalada, con tu catálogo');
   },
   async limpiarHistorial(){
+    if(!esAdmin()){ toast('Solo el administrador'); return; }
     const viejos=DB.dias.filter(d=>d.fecha!==today());
     if(!viejos.length){ toast('No hay días anteriores'); return; }
-    if(!confirm('Se borran '+viejos.length+' día(s) anteriores a hoy. Productos, clientes y deudas NO se tocan. ¿Seguro?')) return;
-    DB.dias=DB.dias.filter(d=>d.fecha===today()); await persist(); toast('Días anteriores borrados'); render();
+    /* Aviso honesto: borrar los días deja los fiados sin su venta, y ahí es donde
+       Balance empieza a mostrar plata de ventas que ya no existen. */
+    const fiadosVivos=(DB.fiados||[]).filter(f=>f.estado!=='pagado').length;
+    const conAbonos=(DB.fiados||[]).filter(f=>(f.abonos||[]).length).length;
+    if(!confirm('BORRAR LOS DÍAS ANTERIORES A HOY\n\n'
+      +'Se van '+viejos.length+' día(s) con sus ventas y gastos.\n\n'
+      +(fiadosVivos?('OJO: quedan '+fiadosVivos+' fiado(s) sin cobrar que se quedarían SIN su venta.\n'):'')
+      +(conAbonos?('Y '+conAbonos+' con abonos ya recibidos, que seguirían contando en Balance.\n'):'')
+      +'\nEsto es para limpiar pruebas, no para usar con datos reales.\n\n¿Seguro?')) return;
+    if(!confirm('Escribe mentalmente: esto NO se puede deshacer desde la app.\n\nSe guardará una copia de emergencia por si acaso.\n\n¿Confirmas?')) return;
+    puntoDeRestauracion('Borrar días anteriores');
+    DB.dias=DB.dias.filter(d=>d.fecha===today());
+    await persist(); toast('Días anteriores borrados · hay copia de emergencia en Mi negocio'); render();
   },
   async resetDatos(){
     if(!confirm('Esto borra TODO: productos, ventas, historial, clientes. ¿Seguro?')) return;
@@ -2619,6 +2805,11 @@ const App = {
     return monto>0?{concepto,monto}:null;
   },
   ventaCalc(recalcularPrecio){
+    /* La unidad del producto se muestra junto a Cantidad, en vivo */
+    try{
+      const lab=document.getElementById('v_qtylab'), sel=document.getElementById('v_prod');
+      if(lab&&sel) lab.textContent='Cantidad'+(sel.value?' ('+uniPlural(prod(sel.value).unidad)+')':'');
+    }catch(e){}
     const g=i=>document.getElementById(i);
     const pid=(g('v_prod')||{}).value||'';
     const gp=g('v_gprod'), gl=g('v_glibre');
@@ -2933,7 +3124,7 @@ document.addEventListener('input',e=>{ if(e.target.id==='f_precio') e.target.dat
    3) Anti-retroceso de reloj: DB.licencia.maxDate.
    Acceso al panel oculto: toca el logo (login/bloqueo) o la marca de arriba
    5 veces y entra con el PIN de creador (DB.creatorPin, por defecto 2468). */
-const APP_VER = 'v26';
+const APP_VER = 'v30';
 const GRACIA_DIAS = 7;
 /* Cuenta de soporte del creador. No vive en DB.usuarios: el cliente no la ve,
    no la puede editar ni borrar, y sobrevive aunque cambie todas las claves.
@@ -3071,7 +3262,61 @@ function bindCreator(){}
 /* ================================ BOOT ================================ */
 // Si quedó un día abierto de fecha anterior, se cierra y archiva solo. Devuelve true si archivó.
 /* Un día = una sola tarjeta. Si ya existe esa fecha, se funde en ella. */
+/* Los cobros hechos antes de la v24 no quedaron archivados. Se rearman desde
+   los abonos ya guardados, agrupando por número de recibo. Corre una sola vez. */
+function reconstruirPagos(){
+  if(DB._pagosRearmados) return;
+  const yaHay=new Set((DB.pagos||[]).map(p=>p.recibo).filter(Boolean));
+  const grupos={};
+  (DB.fiados||[]).forEach(f=>{
+    (f.abonos||[]).forEach(a=>{
+      const rec=a && a.recibo; if(!rec || yaHay.has(rec)) return;
+      const k=f.clienteId+'|'+rec;
+      if(!grupos[k]) grupos[k]={recibo:rec, clienteId:f.clienteId, fecha:a.fecha||f.fecha,
+        ts:a.ts||0, usuario:a.usuario||'', metodo:a.metodo||'efectivo',
+        referencia:a.referencia||'', comprobante:a.comprobante||null,
+        plata:0, devuelto:0, fiados:[]};
+      const g=grupos[k], monto=montoAbono(a);
+      if(a.esRetorno) g.devuelto+=monto; else g.plata+=monto;
+      g.fiados.push({fecha:f.fecha, detalle:f.detalle, parte:monto, quedo:saldoFiado(f),
+        via:a.esRetorno?'devuelto':'plata'});
+      if((a.ts||0)>g.ts) g.ts=a.ts;
+      if(!a.esRetorno && a.comprobante) g.comprobante=a.comprobante;
+    });
+  });
+  const nuevos=Object.values(grupos).map(g=>{
+    const devs=(DB.retornos||[]).filter(r=>r.aplicado && r.recibo===g.recibo && r.clienteId===g.clienteId)
+      .map(r=>({prodId:r.prodId, nombre:prod(r.prodId).nombre, qty:r.qty, precio:r.precio,
+                valor:valorRetorno(r), fecha:r.fecha}));
+    const restante=(DB.fiados||[]).filter(f=>f.clienteId===g.clienteId && f.estado!=='pagado')
+      .reduce((t,f)=>t+saldoFiado(f),0);
+    return Object.assign({}, g, {id:uid(), cliente:cliente(g.clienteId).nombre,
+      cubierto:g.plata+g.devuelto, deudaAntes:g.plata+g.devuelto+restante,
+      saldoDespues:restante, devoluciones:devs, reconstruido:true});
+  });
+  if(nuevos.length){
+    DB.pagos=[...nuevos, ...(DB.pagos||[])]
+      .sort((a,b)=> (b.ts||0)-(a.ts||0)).slice(0,400);
+  }
+  DB._pagosRearmados=true;
+}
 function sanea(){
+  /* BLINDAJE: si la base llega incompleta (respaldo viejo, documento a medias,
+     restauración), NADA puede tronar. Se garantizan todas las llaves ANTES de
+     recorrer cualquiera de ellas. Antes, un DB sin productos dejaba la app en
+     blanco al arrancar. */
+  if(!DB || typeof DB!=='object') DB={};
+  ['productos','clientes','usuarios','dias','fiados','historial','insumos','proveedores',
+   'compras','cotizaciones','deudas','retornos','pagos','papelera'].forEach(k=>{
+    if(!Array.isArray(DB[k])) DB[k]=[];
+  });
+  if(!DB.negocio || typeof DB.negocio!=='object') DB.negocio={};
+  if(!DB.licencia || typeof DB.licencia!=='object') DB.licencia={activo:true,vence:null,url:'',lastCheck:0,maxDate:''};
+  /* Sin usuarios no se puede entrar nunca más: se repone el dueño */
+  if(!DB.usuarios.length) DB.usuarios=[{id:uid(),nombre:'Dueño',rol:'admin',pin:'1234'}];
+  DB.dias.forEach(d=>{
+    ['mayoreo','libres','gastos','mermas','devoluciones'].forEach(k=>{ if(!Array.isArray(d[k])) d[k]=[]; });
+  });
   DB.fiados=DB.fiados||[]; DB.historial=DB.historial||[];
   DB.insumos=DB.insumos||[]; DB.proveedores=DB.proveedores||[]; DB.compras=DB.compras||[]; DB.cotizaciones=DB.cotizaciones||[]; DB.negocio=DB.negocio||{nombre:'MI NEGOCIO',sub:'',tel:'',nit:'',configurado:false,usaInsumos:true,email:'',direccion:''};
   DB.compras.forEach(c=>{ if(!c.tipo) c.tipo='insumo'; });
@@ -3084,6 +3329,7 @@ function sanea(){
   DB.papelera=DB.papelera||[];
   DB.retornos=DB.retornos||[];
   DB.pagos=DB.pagos||[];
+  reconstruirPagos();
   if(!DB.pagosReconstruidos){ reconstruirPagos(); DB.pagosReconstruidos=true; }
   // ---- Migración al libro por fechas (corre una sola vez) ----
   if(!DB.dias){
@@ -3138,7 +3384,12 @@ function vigilarConexion(){
   registrarSW(); vigilarConexion();
   if(USE_FIRESTORE){ try{ await initFirestore(); }catch(e){ console.warn('Firestore init:',e); } }
   DB = await Store.load();
-  if(!DB){ DB=seed(); await persist(); }
+  if(!DB){
+    /* Última red de seguridad antes de sembrar: si el celular tiene algo, se usa. */
+    const local = localLoad();
+    if(local){ DB=local; }
+    else { DB=seed(); await persist(); }
+  }
   sanea();
 
   const lic=await checkLicense();
