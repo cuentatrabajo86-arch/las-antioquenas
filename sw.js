@@ -3,12 +3,12 @@
    Hace que la app abra sin internet y avisa cuando hay versión nueva.
 
    IMPORTANTE: cada vez que subas un index.html nuevo, súbele el
-   número a VERSION (v33 -> v34 -> v35...). Eso obliga a todos los
+   número a VERSION (v34 -> v35 -> v36...). Eso obliga a todos los
    celulares a bajar la versión nueva. Si no lo cambias, algunos
    clientes seguirán viendo la app vieja.
    =========================================================== */
 
-const VERSION = 'nexbit-v33';
+const VERSION = 'nexbit-v34';
 const SHELL   = VERSION + '-shell';   // la app
 const EXTERNO = VERSION + '-externo'; // fuentes y librerías
 

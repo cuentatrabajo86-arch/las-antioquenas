@@ -475,6 +475,9 @@ async function rescatarLegado(){
 async function arrancarNube(){
   if(!nubeActiva()) return;
   await rescatarLegado();
+  /* Al arrancar SIEMPRE se empuja: si el celular traía algo sin subir de la
+     sesión anterior, esto lo manda antes de que nada más lo pueda tapar. */
+  marcarPendiente(true);
   await subirFusionado();
   if(_suscrito) return;
   _suscrito=true;
@@ -771,19 +774,28 @@ const Store = {
     /* Si la nube contesta vacío NO se devuelve null a secas: antes eso hacía que
        el arranque creara datos de demostración y los guardara ENCIMA de los del
        cliente. Siempre se cae a la copia del celular. */
-    if(nubeActiva()){
-      try{
-        const d=await _docRef.get();
-        if(d.exists && d.data() && d.data().db) return d.data().db;
-      }catch(e){}
+    const local = await localLoad();
+    if(!nubeActiva()) return local;
+
+    let remoto = null;
+    try{
+      const d = await _docRef.get();
+      if(d.exists && d.data() && d.data().db) remoto = d.data().db;
+    }catch(e){}
+    if(!remoto){
       /* Primera vez con llave: se rescata lo que estaba en la ruta vieja */
       try{
-        const v=await _fsRef.collection('app').doc('data').get();
-        if(v.exists && v.data() && v.data().db) return v.data().db;
+        const v = await _fsRef.collection('app').doc('data').get();
+        if(v.exists && v.data() && v.data().db) remoto = v.data().db;
       }catch(e){}
-      return localLoad();
     }
-    return localLoad();
+
+    /* AQUÍ ESTABA LA PÉRDIDA (hasta v33): se devolvía la copia de la nube y la
+       del celular se botaba. Si el celular tenía ventas que aún no habían
+       subido —chip "Sin subir"— al reabrir la app esas ventas desaparecían.
+       Ahora arranca igual que sincroniza: FUSIONANDO las dos. */
+    if(remoto && local) return fusionar(local, remoto);
+    return remoto || local;
   },
   async save(db){
     _revLocal++;
@@ -3415,7 +3427,7 @@ document.addEventListener('input',e=>{ if(e.target.id==='f_precio') e.target.dat
    3) Anti-retroceso de reloj: DB.licencia.maxDate.
    Acceso al panel oculto: toca el logo (login/bloqueo) o la marca de arriba
    5 veces y entra con el PIN de creador (DB.creatorPin, por defecto 2468). */
-const APP_VER = 'v33';
+const APP_VER = 'v34';
 const GRACIA_DIAS = 7;
 /* Cuenta de soporte del creador. No vive en DB.usuarios: el cliente no la ve,
    no la puede editar ni borrar, y sobrevive aunque cambie todas las claves.
