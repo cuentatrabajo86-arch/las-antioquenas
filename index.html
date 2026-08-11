@@ -193,6 +193,10 @@ body.offline .topbar::after{content:'Sin señal · se guarda igual';margin-left:
 .visor{position:fixed;inset:0;z-index:80;background:rgba(8,19,29,.92);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:20px}
 .visor img{max-width:100%;max-height:80vh;border-radius:12px;box-shadow:0 20px 60px -20px #000}
 .vcerrar{border:none;border-radius:12px;padding:12px 26px;background:#fff;color:var(--ink);font:inherit;font-size:14px;font-weight:800;cursor:pointer}
+.saludo{background:linear-gradient(135deg,#14264C,#2D5492);color:#fff;border-radius:18px;
+  padding:16px 18px;margin:0 0 16px;box-shadow:0 10px 26px -18px rgba(18,35,63,.5)}
+.saludodia{font-size:11px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:#E8C766}
+.saludofrase{font-family:'Fraunces',Georgia,serif;font-size:17px;line-height:1.35;margin-top:6px}
 .dprog{height:7px;border-radius:99px;background:var(--line);overflow:hidden;margin:10px 0 8px}
 .dprog i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--verde),#7FCBA6)}
 .lincard{border:1px solid var(--line);border-radius:14px;padding:2px 14px;margin-bottom:16px;background:var(--papel)}
@@ -527,13 +531,89 @@ function leerPuntoDeRestauracion(){
 }
 /* Busca datos que quedaron cojos (típicamente por borrar días y dejar los
    fiados vivos). Solo REPORTA; limpiar es decisión del dueño. */
+/* Registros que quedaron con la fecha del día siguiente por el error de zona
+   horaria (todo lo anotado después de las 7 p. m. antes de la v37). Se detectan
+   comparando la hora real del registro contra el día donde quedó guardado. */
+function fechasCorridas(){
+  const malos=[];
+  /* 1) Ventas, gastos y demás dentro de cada día */
+  (DB.dias||[]).forEach(d=>{
+    ['mayoreo','libres','gastos','mermas','devoluciones'].forEach(k=>{
+      (d[k]||[]).forEach(r=>{
+        if(!r.ts) return;
+        const real=fechaLocal(new Date(r.ts));
+        if(real && real!==d.fecha) malos.push({dia:d.fecha, real, tipo:k, id:r.id,
+          monto:(r.monto!=null?r.monto:totalMov(r))||0});
+      });
+    });
+  });
+  /* 2) Registros sueltos que llevan su propia fecha. Los ABONOS son los que más
+        importan: su fecha decide en qué día entra la plata al Balance. */
+  const sueltos=(lista, etiqueta)=>{
+    (lista||[]).forEach(r=>{
+      if(!r || !r.ts || !r.fecha) return;
+      const real=fechaLocal(new Date(r.ts));
+      if(real && real!==r.fecha) malos.push({dia:r.fecha, real, tipo:etiqueta, id:r.id,
+        monto:(r.monto!=null?r.monto:(r.qty&&r.precio? r.qty*r.precio : 0)), ref:r});
+    });
+  };
+  sueltos(DB.fiados,'fiado');
+  sueltos(DB.retornos,'devolución');
+  sueltos(DB.compras,'compra');
+  sueltos(DB.cotizaciones,'cotización');
+  sueltos(DB.deudas,'deuda');
+  sueltos(DB.pagos,'cobro');
+  (DB.fiados||[]).forEach(f=> sueltos(f.abonos,'abono'));
+  (DB.deudas||[]).forEach(d=> sueltos(d.abonos,'pago de deuda'));
+  return malos;
+}
+async function moverALaFechaReal(){
+  const malos=fechasCorridas();
+  if(!malos.length) return 0;
+  puntoDeRestauracion('Corregir fechas corridas');
+  /* Los registros sueltos no se mueven de sitio: solo se les corrige la fecha */
+  let sueltosArreglados=0;
+  malos.forEach(m=>{
+    if(m.ref){ m.ref.fecha=m.real; sueltosArreglados++;
+      if(m.ref.aplicadoFecha) m.ref.aplicadoFecha=m.real; }
+  });
+  const porId={}; malos.filter(m=>!m.ref).forEach(m=>porId[m.id]=m.real);
+  const sacados=[];
+  (DB.dias||[]).forEach(d=>{
+    ['mayoreo','libres','gastos','mermas','devoluciones'].forEach(k=>{
+      const quedan=[];
+      (d[k]||[]).forEach(r=>{
+        if(porId[r.id]) sacados.push({destino:porId[r.id], tipo:k, reg:r});
+        else quedan.push(r);
+      });
+      d[k]=quedan;
+    });
+  });
+  sacados.forEach(x=>{
+    let dia=(DB.dias||[]).find(d=>d.fecha===x.destino);
+    if(!dia){ dia={id:uid(), fecha:x.destino, mayoreo:[], libres:[], gastos:[], mermas:[], devoluciones:[]}; DB.dias.push(dia); }
+    if(!Array.isArray(dia[x.tipo])) dia[x.tipo]=[];
+    dia[x.tipo].push(x.reg);
+  });
+  DB.dias.sort((a,b)=> a.fecha<b.fecha?1:-1);
+  await persist();
+  return sacados.length + sueltosArreglados;
+}
 function revisarDatos(){
   const fechas=new Set((DB.dias||[]).map(d=>d.fecha));
   const problemas=[];
+  const corridas=fechasCorridas();
+  if(corridas.length) problemas.push({clave:'fechasCorridas', n:corridas.length,
+    boton:'Corregir fechas',
+    titulo:'Hay '+corridas.length+' registro(s) con la fecha corrida un día',
+    detalle:'Lo que se anotaba después de las 7 p. m. quedaba guardado con la fecha del día '
+      +'siguiente. Ya está corregido para lo que registres de ahora en adelante. '
+      +'NO se borra nada: este botón solo devuelve los viejos a su día real.',
+    monto:corridas.reduce((t,c)=>t+(c.monto||0),0)});
   const fiadosHuerfanos=(DB.fiados||[]).filter(f=>f.fecha && !fechas.has(f.fecha));
   const conAbonos=fiadosHuerfanos.filter(f=>(f.abonos||[]).length);
   if(fiadosHuerfanos.length) problemas.push({
-    clave:'fiadosHuerfanos', n:fiadosHuerfanos.length,
+    clave:'fiadosHuerfanos', boton:'Quitar', n:fiadosHuerfanos.length,
     titulo:'Fiados sin su venta',
     detalle:'Quedaron '+fiadosHuerfanos.length+' fiado(s) cuya venta ya no existe'
       +(conAbonos.length?', y '+conAbonos.length+' con abonos que siguen contando como ingreso en Balance':'')
@@ -542,18 +622,18 @@ function revisarDatos(){
   });
   const idsCli=new Set((DB.clientes||[]).map(c=>c.id));
   const sinCliente=(DB.fiados||[]).filter(f=>f.clienteId && !idsCli.has(f.clienteId));
-  if(sinCliente.length) problemas.push({clave:'fiadosSinCliente', n:sinCliente.length,
+  if(sinCliente.length) problemas.push({clave:'fiadosSinCliente', boton:'Quitar', n:sinCliente.length,
     titulo:'Fiados de un cliente borrado',
     detalle:'Hay '+sinCliente.length+' fiado(s) de clientes que ya no están en el catálogo.',
     monto:sinCliente.reduce((t,f)=>t+saldoFiado(f),0)});
   const retSinCli=(DB.retornos||[]).filter(r=>!r.aplicado && r.clienteId && !idsCli.has(r.clienteId));
-  if(retSinCli.length) problemas.push({clave:'retornosHuerfanos', n:retSinCli.length,
+  if(retSinCli.length) problemas.push({clave:'retornosHuerfanos', boton:'Quitar', n:retSinCli.length,
     titulo:'Devoluciones de un cliente borrado',
     detalle:'Hay '+retSinCli.length+' devolución(es) pendientes de clientes que ya no existen.',
     monto:retSinCli.reduce((t,r)=>t+valorRetorno(r),0)});
   const idsProd=new Set((DB.productos||[]).map(p=>p.id));
   const retSinProd=(DB.retornos||[]).filter(r=>!r.aplicado && r.prodId && !idsProd.has(r.prodId));
-  if(retSinProd.length) problemas.push({clave:'retornosSinProducto', n:retSinProd.length,
+  if(retSinProd.length) problemas.push({clave:'retornosSinProducto', boton:'Quitar', n:retSinProd.length,
     titulo:'Devoluciones de un producto borrado',
     detalle:'Hay '+retSinProd.length+' devolución(es) de productos que ya no están en el catálogo.',
     monto:retSinProd.reduce((t,r)=>t+valorRetorno(r),0)});
@@ -882,7 +962,15 @@ let S = { user:null, view:'inicio', sub:null, ctx:{}, fecha:null }; // estado de
 let chartRef = null;
 
 const uid = () => Date.now().toString(36)+Math.random().toString(36).slice(2,7);
-const today = () => new Date().toISOString().slice(0,10);
+/* La fecha del día SIEMPRE en hora local del celular.
+   Antes usaba toISOString(), que da hora universal: en Colombia (UTC-5) todo lo
+   registrado después de las 7 p. m. quedaba fechado al DÍA SIGUIENTE. */
+const fechaLocal = (d) => {
+  d = d || new Date();
+  const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,'0'), dd=String(d.getDate()).padStart(2,'0');
+  return `${y}-${m}-${dd}`;
+};
+const today = () => fechaLocal();
 const fmtFecha = d => new Date(d+'T12:00:00').toLocaleDateString('es-CO',{weekday:'short',day:'numeric',month:'short'});
 const COP = new Intl.NumberFormat('es-CO',{style:'currency',currency:'COP',maximumFractionDigits:0});
 const $ = money => COP.format(Math.round(money||0));
@@ -1264,7 +1352,8 @@ function vInicio(){
   const fiado=j?movsDia(j).reduce((t,m)=>t+saldoMov(m),0):0;
   const deuda=DB.fiados.filter(x=>x.estado!=='pagado').reduce((t,x)=>t+saldoFiado(x),0);
   const sinProd=!DB.productos.filter(x=>x.activo).length;
-  return `<div class="view-title">${hoy?'Hoy':fmtFecha(f)}</div>
+  return `${saludoDelDia()}
+    <div class="view-title">${hoy?'Hoy':fmtFecha(f)}</div>
     <div class="view-sub">Muévete de día con las flechas. Todo se guarda solo.</div>
     ${alertaInsumos()}
     <div class="datebar">
@@ -1427,6 +1516,44 @@ function vBalance(){
 
 const nombreUsuario = id => (DB.usuarios.find(u=>u.id===id)||{}).nombre||'—';
 /* ===== LIBRO POR FECHAS: un día = un registro en DB.dias. Sin abrir ni cerrar. ===== */
+/* Saludo del día: la fecha completa y una frase que cambia sola cada día.
+   La frase se escoge por la fecha, no al azar, así que es la misma toda la
+   jornada y cambia sola a medianoche. */
+const FRASES = [
+  'Que hoy sea un gran día para tu negocio.',
+  'Dios bendiga tu negocio y tu trabajo de hoy.',
+  'Cada venta de hoy es un paso más adelante.',
+  'Con orden y constancia, el negocio crece solo.',
+  'Hoy también se puede. Ánimo y a vender.',
+  'Que la bendición no le falte a esta casa ni a este negocio.',
+  'Lo que se anota, se controla. Vas bien.',
+  'Un día a la vez, un peso a la vez. Así se construye.',
+  'Que hoy entren buenos clientes y buenas ventas.',
+  'Tu esfuerzo de hoy es la tranquilidad de mañana.',
+  'Salud, trabajo y buenas ventas para hoy.',
+  'Que Dios prospere el trabajo de tus manos.'
+];
+function fechaLarga(f){
+  try{
+    const t=new Date((f||today())+'T12:00:00')
+      .toLocaleDateString('es-CO',{weekday:'long',day:'numeric',month:'long',year:'numeric'});
+    return t.charAt(0).toUpperCase()+t.slice(1);
+  }catch(e){ return fmtFecha(f||today()); }
+}
+function fraseDelDia(f){
+  const p=(f||today()).split('-');
+  const n=(parseInt(p[0],10)*372 + parseInt(p[1],10)*31 + parseInt(p[2],10)) || 0;
+  return FRASES[n % FRASES.length];
+}
+function saludoDelDia(){
+  if(!esHoy()) return '';                       /* solo al ver el día de hoy */
+  const nom=((S.user&&S.user.nombre)||'').split(' ')[0];
+  return `<div class="saludo">
+    <div class="saludodia">${fechaLarga(today())}</div>
+    <div class="saludofrase">${(()=>{const fr=fraseDelDia(today());
+      return nom ? nom+', '+fr.charAt(0).toLowerCase()+fr.slice(1) : fr;})()}</div>
+  </div>`;
+}
 const fechaSel = () => S.fecha||today();
 const esHoy = () => fechaSel()===today();
 function nuevoDia(f){ return {id:uid(),fecha:f,trabajadorId:S.user?S.user.id:'',mayoreo:[],mermas:[],gastos:[],libres:[],devoluciones:[]}; }
@@ -2275,12 +2402,12 @@ function panelNegocio(){
       if(!probs.length && !punto) return '';
       return `<div class="seclabel">Salud de los datos</div>
       ${probs.length?`<div class="card" style="border-color:var(--warn-line);background:var(--warn-bg)">
-        <h3 style="color:var(--warn)">Encontré datos incompletos</h3>
-        <div class="hint" style="margin:0 0 12px">Suele pasar al borrar días y dejar los fiados vivos. Por eso Balance puede mostrar plata de ventas que ya no existen.</div>
+        <h3 style="color:var(--warn)">Hay algo por revisar</h3>
+        <div class="hint" style="margin:0 0 12px">Nada se ha perdido. Aquí te muestro lo que conviene acomodar, con un botón para hacerlo y una copia de seguridad automática antes.</div>
         ${probs.map(p=>`<div class="row"><div style="min-width:0">
           <div class="lab">${p.titulo}</div><div class="sub">${p.detalle}</div></div>
           <div style="text-align:right;flex:none"><div class="val" style="color:var(--warn)">${$(p.monto)}</div>
-          <button class="btn btn-sm btn-line" style="width:auto;margin-top:6px" onclick="App.limpiarBasura('${p.clave}')">Quitar</button></div></div>`).join('')}
+          <button class="btn btn-sm btn-line" style="width:auto;margin-top:6px" onclick="App.limpiarBasura('${p.clave}')">${p.boton||'Quitar'}</button></div></div>`).join('')}
       </div>`:`<div class="card"><h3>Todo cuadra</h3>
         <div class="hint" style="margin:0">No hay fiados sin venta ni registros de clientes o productos borrados.</div></div>`}
       ${punto?`<div class="card">
@@ -2497,7 +2624,7 @@ const App = {
   sub(s){ S.sub=s; render(); window.scrollTo(0,0); },
   async form(t){ if(['venta','merma','gasto','devolucion'].includes(t) && !dia()){ dia(true); await persist(); } S.view='form'; S.sub=t; render(); window.scrollTo(0,0); },
   irFecha(f){ S.fecha=f||today(); S.view='inicio'; S.sub=null; S.ctx={}; render(); window.scrollTo(0,0); },
-  moverDia(n){ const d=new Date(fechaSel()+'T12:00:00'); d.setDate(d.getDate()+n); const f=d.toISOString().slice(0,10); if(f>today()) return; S.fecha=f; render(); },
+  moverDia(n){ const d=new Date(fechaSel()+'T12:00:00'); d.setDate(d.getDate()+n); const f=fechaLocal(d); if(f>today()) return; S.fecha=f; render(); },
   buscar(){ const g=i=>(document.getElementById(i)||{}).value;
     if(document.getElementById('b_q')) S.ctx.q=g('b_q')||'';
     S.ctx.bDesde=g('b_desde')||null; S.ctx.bHasta=g('b_hasta')||null; render(); },
@@ -2865,6 +2992,14 @@ const App = {
   },
   async limpiarBasura(clave){
     const p=revisarDatos().find(x=>x.clave===clave); if(!p) return;
+    if(clave==='fechasCorridas'){
+      if(!confirm('CORREGIR LAS FECHAS\n\n'+p.detalle+'\n\n'
+        +'No se borra nada: los registros se mueven al día en que de verdad se anotaron.\n'
+        +'Se guarda una copia de emergencia antes.\n\n¿Seguro?')) return;
+      const n=await moverALaFechaReal(); render();
+      toast(n+' registro(s) movidos a su día real');
+      return;
+    }
     if(!confirm(p.titulo.toUpperCase()+'\n\n'+p.detalle+'\n\n'
       +'Se van a quitar '+p.n+' registro(s) por '+$(p.monto)+'.\n'
       +'Se guarda una copia de emergencia antes.\n\n¿Seguro?')) return;
@@ -3485,7 +3620,7 @@ document.addEventListener('input',e=>{ if(e.target.id==='f_precio') e.target.dat
    3) Anti-retroceso de reloj: DB.licencia.maxDate.
    Acceso al panel oculto: toca el logo (login/bloqueo) o la marca de arriba
    5 veces y entra con el PIN de creador (DB.creatorPin, por defecto 2468). */
-const APP_VER = 'v36';
+const APP_VER = 'v40';
 const GRACIA_DIAS = 7;
 /* Cuenta de soporte del creador. No vive en DB.usuarios: el cliente no la ve,
    no la puede editar ni borrar, y sobrevive aunque cambie todas las claves.
@@ -3589,7 +3724,7 @@ function creatorView(){
     <div class="card"><h3>Estado</h3>
       <div class="row"><div class="lab">Activa</div><div class="val">${L.activo?'<span class="pill v">Si</span>':'<span class="pill f">No</span>'}</div></div>
       <div class="row"><div class="lab">Vence prueba</div><div class="val">${L.vence||'sin limite'}</div></div>
-      <div class="row"><div class="lab">Ultima validacion</div><div class="val">${L.lastCheck?fmtFecha(new Date(L.lastCheck).toISOString().slice(0,10)):'nunca'}</div></div>
+      <div class="row"><div class="lab">Ultima validacion</div><div class="val">${L.lastCheck?fmtFecha(fechaLocal(new Date(L.lastCheck))):'nunca'}</div></div>
     </div>
     <div class="card"><h3>Bloqueo remoto</h3>
       <label class="fld"><span>URL de licencia</span><input type="text" id="c_url" value="${L.url||''}" placeholder="./licencia.json"></label>
