@@ -197,6 +197,12 @@ body.offline .topbar::after{content:'Sin señal · se guarda igual';margin-left:
   padding:16px 18px;margin:0 0 16px;box-shadow:0 10px 26px -18px rgba(18,35,63,.5)}
 .saludodia{font-size:11px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:#E8C766}
 .saludofrase{font-family:'Fraunces',Georgia,serif;font-size:17px;line-height:1.35;margin-top:6px}
+.diaesc{display:flex;align-items:center;justify-content:space-between;gap:12px;
+  background:#EEF2F8;border:1px solid #CBD8E8;border-radius:14px;padding:12px 14px;margin:0 0 14px}
+.diaesclab{font-size:10.5px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#5E7186}
+.diaescval{font-size:15px;font-weight:800;color:#14264C;margin-top:2px}
+.diaescbtn{flex:none;border:1px solid #B9CBE0;background:#fff;color:#14264C;border-radius:10px;
+  padding:9px 14px;font:inherit;font-size:12.5px;font-weight:800;cursor:pointer}
 .dprog{height:7px;border-radius:99px;background:var(--line);overflow:hidden;margin:10px 0 8px}
 .dprog i{display:block;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--verde),#7FCBA6)}
 .lincard{border:1px solid var(--line);border-radius:14px;padding:2px 14px;margin-bottom:16px;background:var(--papel)}
@@ -534,15 +540,27 @@ function leerPuntoDeRestauracion(){
 /* Registros que quedaron con la fecha del día siguiente por el error de zona
    horaria (todo lo anotado después de las 7 p. m. antes de la v37). Se detectan
    comparando la hora real del registro contra el día donde quedó guardado. */
+/* El bug de zona horaria tenía una firma EXACTA: el registro quedaba guardado
+   justo UN DÍA DESPUÉS de su fecha real, y solo pasaba entre las 7 p. m. y la
+   medianoche. Cualquier otra diferencia es intencional —el dueño fue a un día
+   viejo a registrar algo— y NO se puede tocar. */
+function esFechaCorrida(ts, guardada){
+  if(!ts || !guardada) return false;
+  const f=new Date(ts);
+  if(f.getHours() < 19) return false;               /* el bug solo pegaba de noche */
+  const real=fechaLocal(f);
+  if(real >= guardada) return false;                /* guardada debe ir DESPUÉS */
+  const sig=new Date(f); sig.setDate(sig.getDate()+1);
+  return fechaLocal(sig) === guardada;              /* exactamente un día después */
+}
 function fechasCorridas(){
   const malos=[];
   /* 1) Ventas, gastos y demás dentro de cada día */
   (DB.dias||[]).forEach(d=>{
     ['mayoreo','libres','gastos','mermas','devoluciones'].forEach(k=>{
       (d[k]||[]).forEach(r=>{
-        if(!r.ts) return;
-        const real=fechaLocal(new Date(r.ts));
-        if(real && real!==d.fecha) malos.push({dia:d.fecha, real, tipo:k, id:r.id,
+        if(!esFechaCorrida(r.ts, d.fecha)) return;
+        malos.push({dia:d.fecha, real:fechaLocal(new Date(r.ts)), tipo:k, id:r.id,
           monto:(r.monto!=null?r.monto:totalMov(r))||0});
       });
     });
@@ -551,9 +569,8 @@ function fechasCorridas(){
         importan: su fecha decide en qué día entra la plata al Balance. */
   const sueltos=(lista, etiqueta)=>{
     (lista||[]).forEach(r=>{
-      if(!r || !r.ts || !r.fecha) return;
-      const real=fechaLocal(new Date(r.ts));
-      if(real && real!==r.fecha) malos.push({dia:r.fecha, real, tipo:etiqueta, id:r.id,
+      if(!r || !esFechaCorrida(r.ts, r.fecha)) return;
+      malos.push({dia:r.fecha, real:fechaLocal(new Date(r.ts)), tipo:etiqueta, id:r.id,
         monto:(r.monto!=null?r.monto:(r.qty&&r.precio? r.qty*r.precio : 0)), ref:r});
     });
   };
@@ -567,10 +584,13 @@ function fechasCorridas(){
   (DB.deudas||[]).forEach(d=> sueltos(d.abonos,'pago de deuda'));
   return malos;
 }
-async function moverALaFechaReal(){
-  const malos=fechasCorridas();
-  if(!malos.length) return 0;
-  puntoDeRestauracion('Corregir fechas corridas');
+/* POR QUÉ ESTO SE PUEDE HACER SOLO, SIN PREGUNTAR:
+   la app nunca deja guardar en un día futuro (todos los campos de fecha tienen
+   tope en hoy y el navegador de días bloquea el mañana). Entonces un registro
+   guardado UN DÍA DESPUÉS de su hora real solo puede venir del bug de zona
+   horaria. No hay caso legítimo que se le parezca, así que se acomoda solo. */
+function aplicarMovimientoFechas(malos){
+  if(!malos || !malos.length) return 0;
   /* Los registros sueltos no se mueven de sitio: solo se les corrige la fecha */
   let sueltosArreglados=0;
   malos.forEach(m=>{
@@ -589,6 +609,10 @@ async function moverALaFechaReal(){
       d[k]=quedan;
     });
   });
+  /* Un fiado nace de una venta: si la venta cambia de día, el fiado también */
+  sacados.forEach(x=>{
+    (DB.fiados||[]).forEach(f=>{ if(f.origen===x.reg.id) f.fecha=x.destino; });
+  });
   sacados.forEach(x=>{
     let dia=(DB.dias||[]).find(d=>d.fecha===x.destino);
     if(!dia){ dia={id:uid(), fecha:x.destino, mayoreo:[], libres:[], gastos:[], mermas:[], devoluciones:[]}; DB.dias.push(dia); }
@@ -596,8 +620,26 @@ async function moverALaFechaReal(){
     dia[x.tipo].push(x.reg);
   });
   DB.dias.sort((a,b)=> a.fecha<b.fecha?1:-1);
-  await persist();
   return sacados.length + sueltosArreglados;
+}
+/* Botón manual del panel de soporte */
+async function moverALaFechaReal(){
+  const malos=fechasCorridas();
+  if(!malos.length) return 0;
+  puntoDeRestauracion('Corregir fechas corridas');
+  const n=aplicarMovimientoFechas(malos);
+  await persist();
+  return n;
+}
+/* Reparación silenciosa: corre sola al abrir y cada vez que llega algo de la nube */
+function repararFechasAuto(){
+  let malos;
+  try{ malos=fechasCorridas(); }catch(e){ return 0; }
+  if(!malos.length) return 0;
+  if(!DB._repFechas){ try{ puntoDeRestauracion('Antes de acomodar las fechas'); }catch(e){} }
+  const n=aplicarMovimientoFechas(malos);
+  DB._repFechas=(Number(DB._repFechas)||0)+n;
+  return n;
 }
 function revisarDatos(){
   const fechas=new Set((DB.dias||[]).map(d=>d.fecha));
@@ -1263,7 +1305,7 @@ function setupView(){
     <button class="btn btn-primary" onclick="App.terminarSetup()">Empezar a vender</button>
   </div></div>`;
 }
-const TFG={venta:'Nueva venta',deuda:'Anotar lo que debes',gasto:'Gasto',
+const TFG={venta:'Nueva venta',moverfecha:'Cambiar de día',deuda:'Anotar lo que debes',gasto:'Gasto',
   merma:'Se dañó un producto',devolucion:'Devolver plata',coti:'Cotización',compra:'Registrar compra'};
 /* La barra dice exactamente lo mismo que el título de la pantalla. */
 function tituloForm(){
@@ -1325,14 +1367,14 @@ function navbar(){
 function viewRouter(){
   switch(S.view){
     case 'inicio': return vInicio();
-    case 'registrar': return vRegistrar();
+    case 'registrar': return avisoDia()+vRegistrar();
     case 'buscar': return vBalance();
-    case 'cobros': return vCobros();
+    case 'cobros': return avisoDia()+vCobros();
     case 'deudas': return vDeudas();
     case 'pagos': return vPagos();
     case 'ajustes': return vAjustes();
     case 'informe': return vInforme();
-    case 'form': return vForm();
+    case 'form': return avisoDia()+vForm();
     default: return vInicio();
   }
 }
@@ -1616,11 +1658,22 @@ function resumenRegistros(){
   if(!items.length) return '';
   return `<div class="seclabel">Registrado el ${fmtFecha(j.fecha)}</div><div class="card">${items.map(it=>`
     <div class="row"><div style="flex:1"><div class="lab">${it.d}</div><div class="sub">${it.t}</div>${it.extra||''}</div>
-    <div style="text-align:right"><div class="val">${it.v}</div>${it.p}<div>${it.r?`<button class="xdel" style="color:var(--mango-text);margin-right:12px" onclick="${it.r}">Recibo</button>`:''}<button class="xdel" onclick="${it.x}">Quitar</button></div></div></div>`).join('')}</div>
-    <div class="hint" style="margin-top:-6px">¿Te equivocaste? Puedes quitar cualquier registro cuando quieras.</div>`;
+    <div style="text-align:right"><div class="val">${it.v}</div>${it.p}<div>${it.r?`<button class="xdel" style="color:var(--mango-text);margin-right:12px" onclick="${it.r}">Recibo</button>`:''}${it.x?`<button class="xdel" style="color:var(--mango-text);margin-right:12px" onclick="${it.x.replace('App.delRegistro','App.moverRegistro')}">Mover</button>`:''}<button class="xdel" onclick="${it.x}">Quitar</button></div></div></div>`).join('')}</div>
+    <div class="hint" style="margin-top:-6px">¿Te equivocaste? <b>Mover</b> lo pasa a otro día y <b>Quitar</b> lo elimina.</div>`;
 }
 
 /* -------------------------------- FORMS -------------------------------- */
+/* Cuando se está trabajando en un día que no es hoy, se dice claro y sin
+   alarma, con un toque para volver. Así nadie anota en el día equivocado. */
+function avisoDia(){
+  const f=fechaSel();
+  if(f===today()) return '';
+  return `<div class="diaesc">
+    <div><div class="diaesclab">Estás anotando en</div>
+    <div class="diaescval">${fmtFecha(f)}</div></div>
+    <button class="diaescbtn" onclick="App.volverHoy()">Volver a hoy</button>
+  </div>`;
+}
 function vForm(){
   const t=S.sub;
   const back=`<div style="height:8px"></div><button class="btn btn-line" onclick="App.go('registrar')">Cancelar</button>`;
@@ -1661,6 +1714,26 @@ function vForm(){
         ${esUnicoAdmin?`<div class="hint">Es el único administrador, por eso no se le puede cambiar el rol. Crea otro administrador primero.</div>`:''}
       </div>
       <button class="btn btn-primary" onclick="App.guardarEmp()">${u?'Guardar cambios':'Crear trabajador'}</button>${back}`;
+  }
+  if(t==='moverfecha'){
+    const mv=S.ctx.mover||{};
+    return `<div class="view-title">Cambiar de día</div>
+      <div class="view-sub">Pasa este registro al día en que de verdad ocurrió.</div>
+      <div class="card">
+        <div class="row" style="border:none;padding:0 0 12px">
+          <div style="min-width:0"><div class="lab">${mv.titulo||''}</div>
+          <div class="sub">${mv.detalle||''}</div></div>
+          <div class="val">${$(mv.monto||0)}</div>
+        </div>
+        <div class="row" style="border:none;padding:0 0 12px">
+          <div class="sub">Hoy está guardado en</div>
+          <div class="val" style="color:var(--warn)">${fmtFecha(mv.desde||today())}</div>
+        </div>
+        <label class="fld"><span>Pasarlo a este día</span>
+          <input type="date" id="mv_fecha" max="${today()}" value="${mv.desde||today()}"></label>
+        <div class="hint" style="margin:0">Se mueve el registro completo. Si era una venta fiada, su deuda se va con él.</div>
+      </div>
+      <button class="btn btn-primary" onclick="App.confirmarMover()">Cambiar el día</button>${back}`;
   }
   if(t==='retorno'){
     const cid=(S.ctx.retorno&&S.ctx.retorno.clienteId)||'';
@@ -1739,6 +1812,9 @@ function vForm(){
             <div><div class="lab">Queda debiendo</div><div class="sub">después de descontar lo devuelto</div></div>
             <div class="val" style="font-size:18px;color:var(--ink)">${$(Math.max(0,(a.deuda||0)-val))}</div></div>`:''}`;
         })()}
+        <label class="fld"><span>¿Qué día ${a.modo==='pago'?'pagaste':'te pagó'}?</span>
+          <input type="date" id="ab_fecha" max="${today()}" value="${a.fecha||fechaSel()}"></label>
+        <div class="hint" style="margin:-8px 0 14px">Si te están pagando algo de días atrás, escoge ese día para que quede en su fecha.</div>
         <label class="fld"><span>¿Cuánto ${a.modo==='pago'?'pagas':'abona'} en plata?</span>
           <input type="number" min="0" inputmode="numeric" id="ab_monto" value="${a.monto||''}" placeholder="0" oninput="App.abonoCalc()"></label>
         <button class="btn btn-line btn-sm" onclick="App.abonoTodo()">Pagar todo (${$(topeAbono(a))})</button>
@@ -2398,7 +2474,11 @@ function panelNegocio(){
       <p class="hint" style="margin:0 0 12px">Cambia el <b>nombre con el que entras</b> y tu clave de 4 dígitos. Para los trabajadores: Ajustes → Empleados → Nombre y clave.</p>
       <button class="btn btn-line" onclick="App.cambiarUsuario()">Cambiar mi usuario y mi clave</button>
     </div>
-    ${(()=>{const probs=revisarDatos(), punto=leerPuntoDeRestauracion();
+    ${(()=>{
+      /* Panel técnico: SOLO para la cuenta de soporte. El dueño del negocio no
+         tiene por qué ver avisos internos que no sabe interpretar. */
+      if(!(S.user && S.user.creador)) return '';
+      const probs=revisarDatos(), punto=leerPuntoDeRestauracion();
       if(!probs.length && !punto) return '';
       return `<div class="seclabel">Salud de los datos</div>
       ${probs.length?`<div class="card" style="border-color:var(--warn-line);background:var(--warn-bg)">
@@ -2788,11 +2868,12 @@ const App = {
   },
   toggleRetornos(){
     const g=i=>(document.getElementById(i)||{}).value||'';
-    S.ctx.abono=Object.assign({},S.ctx.abono,{monto:g('ab_monto'), referencia:g('ab_ref'),
+    S.ctx.abono=Object.assign({},S.ctx.abono,{monto:g('ab_monto'), referencia:g('ab_ref'), fecha:g('ab_fecha'),
       usarRetornos:(document.getElementById('ab_usaret')||{}).checked});
     render();
   },
-  abonoMetodo(m){ S.ctx.abono.monto=(document.getElementById('ab_monto')||{}).value||''; S.ctx.abono.metodo=m; render(); },
+  abonoMetodo(m){ const g=i=>(document.getElementById(i)||{}).value||'';
+    S.ctx.abono=Object.assign({},S.ctx.abono,{monto:g('ab_monto'), referencia:g('ab_ref'), fecha:g('ab_fecha'), metodo:m}); render(); },
   abonoTodo(){ const i=document.getElementById('ab_monto'); if(i){ i.value=S.ctx.abono.deuda; this.abonoCalc(); } },
   abonoCalc(){
     const a=S.ctx.abono, v=parseInt((document.getElementById('ab_monto')||{}).value)||0;
@@ -2814,7 +2895,7 @@ const App = {
     if(!/^image\//.test(f.type)){ toast('Escoge una imagen'); return; }
     toast('Preparando la foto...');
     const g=i=>(document.getElementById(i)||{}).value||'';
-    S.ctx.abono=Object.assign({},S.ctx.abono,{monto:g('ab_monto'), referencia:g('ab_ref')});
+    S.ctx.abono=Object.assign({},S.ctx.abono,{monto:g('ab_monto'), referencia:g('ab_ref'), fecha:g('ab_fecha')});
     try{
       const data=await comprimirFoto(f);
       if(!data){ toast('Esa foto pesa mucho, prueba con otra'); return; }
@@ -2823,7 +2904,7 @@ const App = {
   },
   quitarFoto(){
     const g=i=>(document.getElementById(i)||{}).value||'';
-    S.ctx.abono=Object.assign({},S.ctx.abono,{monto:g('ab_monto'), referencia:g('ab_ref'), foto:null});
+    S.ctx.abono=Object.assign({},S.ctx.abono,{monto:g('ab_monto'), referencia:g('ab_ref'), fecha:g('ab_fecha'), foto:null});
     render();
   },
   async verFoto(id){
@@ -2878,7 +2959,8 @@ const App = {
     const referencia=((document.getElementById('ab_ref')||{}).value||'').trim();
     let comprobante=null;
     if(a.foto){ toast('Guardando el comprobante...'); comprobante=await guardarComprobante(a.foto); }
-    const base={metodo:a.metodo, referencia, comprobante, fecha:today(), ts:Date.now(),
+    const fEscogida=((document.getElementById('ab_fecha')||{}).value||'').slice(0,10) || today();
+    const base={metodo:a.metodo, referencia, comprobante, fecha:(fEscogida<=today()?fEscogida:today()), ts:Date.now(),
       usuarioId:S.user?S.user.id:'', usuario:S.user?S.user.nombre:''};
 
     if(a.modo==='pago'){
@@ -3039,6 +3121,7 @@ const App = {
     this._tbc=setTimeout(()=>{ render(); const i=document.getElementById('b_q');
       if(i){ i.focus(); i.setSelectionRange(i.value.length,i.value.length); } }, 260);
   },
+  volverHoy(){ S.fecha=null; render(); window.scrollTo(0,0); },
   cerrarAviso(){ S.ctx.ultimoAbono=null; render(); },
 
   /* ---- Config CRUD (admin) ---- */
@@ -3456,6 +3539,42 @@ const App = {
   },
   async delProv(id){ if(!confirm('¿Eliminar este proveedor?')) return; DB.proveedores=DB.proveedores.filter(v=>v.id!==id); await persist(); App.volverAjustes('prov'); toast('Proveedor eliminado'); },
   compraTipoChange(){ S.ctx.compraTipo=document.getElementById('co_tipo').value; render(); },
+  moverRegistro(tipo,id){
+    if(!esAdmin()){ toast('Solo el administrador'); return; }
+    const j=dia(); if(!j) return;
+    const lista = tipo==='libre'?(j.libres||[]) : tipo==='mayoreo'?j.mayoreo
+                : tipo==='merma'?j.mermas : tipo==='gasto'?j.gastos : (j.devoluciones||[]);
+    const reg=lista.find(x=>x.id===id); if(!reg) return;
+    const nom = tipo==='gasto' ? (reg.concepto||'Gasto')
+      : (reg.clienteId?cliente(reg.clienteId).nombre:'Venta rápida');
+    S.ctx={mover:{tipo, id, desde:j.fecha, titulo:nom,
+      detalle:({libre:'Venta',mayoreo:'Venta',gasto:'Gasto',merma:'Producto dañado',devolucion:'Devolución de plata'})[tipo]||'Registro',
+      monto:(reg.monto!=null?reg.monto:totalMov(reg))||0}};
+    S.view='form'; S.sub='moverfecha'; render(); window.scrollTo(0,0);
+  },
+  async confirmarMover(){
+    const mv=S.ctx.mover; if(!mv) return;
+    const destino=((document.getElementById('mv_fecha')||{}).value||'').slice(0,10);
+    if(!destino){ toast('Escoge el día'); return; }
+    if(destino>today()){ toast('No puedes pasarlo a un día que todavía no llega'); return; }
+    if(destino===mv.desde){ toast('Ya está en ese día'); return; }
+    if(!confirm('CAMBIAR DE DÍA\n\n'+mv.titulo+' · '+$(mv.monto)+'\n\n'
+      +'De '+fmtFecha(mv.desde)+'\na '+fmtFecha(destino)+'\n\n'
+      +'Se guarda una copia de seguridad antes. ¿Seguro?')) return;
+    puntoDeRestauracion('Cambiar de día un registro');
+    const origen=(DB.dias||[]).find(d=>d.fecha===mv.desde); if(!origen) return;
+    const campo={libre:'libres',mayoreo:'mayoreo',gasto:'gastos',merma:'mermas',devolucion:'devoluciones'}[mv.tipo];
+    const i=(origen[campo]||[]).findIndex(x=>x.id===mv.id); if(i<0) return;
+    const reg=origen[campo].splice(i,1)[0];
+    let dest=(DB.dias||[]).find(d=>d.fecha===destino);
+    if(!dest){ dest=nuevoDia(destino); DB.dias.push(dest); DB.dias.sort((a,b)=>a.fecha<b.fecha?1:-1); }
+    if(!Array.isArray(dest[campo])) dest[campo]=[];
+    dest[campo].push(reg);
+    /* La deuda que nació de esa venta se va con ella */
+    (DB.fiados||[]).forEach(f=>{ if(f.origen===mv.id) f.fecha=destino; });
+    S.ctx={}; await persist(); S.fecha=destino; S.view='inicio'; render();
+    toast('Listo — quedó en '+fmtFecha(destino));
+  },
   async delRegistro(tipo,id){
     const j=dia(); if(!j) return;
     const lista = tipo==='libre'?(j.libres||[]) : tipo==='mayoreo'?j.mayoreo
@@ -3620,7 +3739,7 @@ document.addEventListener('input',e=>{ if(e.target.id==='f_precio') e.target.dat
    3) Anti-retroceso de reloj: DB.licencia.maxDate.
    Acceso al panel oculto: toca el logo (login/bloqueo) o la marca de arriba
    5 veces y entra con el PIN de creador (DB.creatorPin, por defecto 2468). */
-const APP_VER = 'v40';
+const APP_VER = 'v43';
 const GRACIA_DIAS = 7;
 /* Cuenta de soporte del creador. No vive en DB.usuarios: el cliente no la ve,
    no la puede editar ni borrar, y sobrevive aunque cambie todas las claves.
@@ -3638,6 +3757,7 @@ async function huella(txt){
 let _revLocal = 0;
 let _fsRef = null;
 let _reemplazoPorSubir = false;
+let _guardarTrasReparar = null;
 function sumarDias(fechaISO,n){
   const b=(fechaISO||today()).split('-');
   const d=new Date(+b[0],+b[1]-1,+b[2]); d.setDate(d.getDate()+n);
@@ -3851,6 +3971,14 @@ function sanea(){
   DB.licencia=DB.licencia||{activo:true,vence:null,url:'',lastCheck:0,maxDate:''};
   DB.creatorPin=DB.creatorPin||'2468';
   DB._tumbas=Array.isArray(DB._tumbas)?DB._tumbas:[];
+  /* Acomoda solo las fechas que quedaron corridas por el bug de zona horaria.
+     Es idempotente: si no hay nada corrido, no hace ni guarda nada. */
+  try{
+    if(repararFechasAuto()>0){
+      clearTimeout(_guardarTrasReparar);
+      _guardarTrasReparar=setTimeout(()=>{ try{ persist(); }catch(e){} }, 1200);
+    }
+  }catch(e){}
 }
 /* ---- Modo sin internet + aviso de version nueva ---- */
 /* Actualización silenciosa PERO segura.
