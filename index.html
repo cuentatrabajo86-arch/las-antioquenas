@@ -641,9 +641,51 @@ function repararFechasAuto(){
   DB._repFechas=(Number(DB._repFechas)||0)+n;
   return n;
 }
+/* Duplicados que ya quedaron creados antes de la v46 */
+function nombresDuplicados(lista){
+  const g={};
+  (lista||[]).forEach(x=>{ const n=normNombre(x&&x.nombre); if(!n) return; (g[n]=g[n]||[]).push(x); });
+  return Object.values(g).filter(a=>a.length>1);
+}
+/* Une dos fichas en una: TODO lo que apuntaba a la vieja pasa a la buena.
+   No se borra ni un peso, solo se cambia a quién pertenece. */
+async function unirFichas(tipo, idBueno, idsViejos){
+  puntoDeRestauracion('Unir '+tipo+' repetidos');
+  const viejos=new Set(idsViejos);
+  let tocados=0;
+  if(tipo==='cliente'){
+    (DB.fiados||[]).forEach(f=>{ if(viejos.has(f.clienteId)){ f.clienteId=idBueno; tocados++; } });
+    (DB.retornos||[]).forEach(r=>{ if(viejos.has(r.clienteId)){ r.clienteId=idBueno; tocados++; } });
+    (DB.pagos||[]).forEach(p=>{ if(viejos.has(p.clienteId)) p.clienteId=idBueno; });
+    (DB.dias||[]).forEach(d=>['mayoreo','libres','devoluciones'].forEach(k=>
+      (d[k]||[]).forEach(r=>{ if(viejos.has(r.clienteId)){ r.clienteId=idBueno; tocados++; } })));
+    (DB.cotizaciones||[]).forEach(c=>{ if(viejos.has(c.clienteId)) c.clienteId=idBueno; });
+    DB.clientes=(DB.clientes||[]).filter(c=>!viejos.has(c.id));
+  } else {
+    (DB.deudas||[]).forEach(d=>{ if(viejos.has(d.proveedorId)){ d.proveedorId=idBueno;
+      d.acreedor=(proveedor(idBueno)||{}).nombre||d.acreedor; tocados++; } });
+    (DB.compras||[]).forEach(c=>{ if(viejos.has(c.proveedorId)){ c.proveedorId=idBueno; tocados++; } });
+    DB.proveedores=(DB.proveedores||[]).filter(x=>!viejos.has(x.id));
+  }
+  await persist();
+  return tocados;
+}
 function revisarDatos(){
   const fechas=new Set((DB.dias||[]).map(d=>d.fecha));
   const problemas=[];
+  [['cliente','clientes',DB.clientes],['proveedor','proveedores',DB.proveedores],
+   ['producto','productos',DB.productos]].forEach(([sing,plu,lista])=>{
+    const dups=nombresDuplicados(lista);
+    if(!dups.length) return;
+    problemas.push({clave:'dup-'+sing, n:dups.length,
+      boton: sing==='producto' ? 'Ver cuáles' : 'Unirlos',
+      titulo:'Hay '+plu+' repetidos con el mismo nombre',
+      detalle:dups.map(a=>'"'+a[0].nombre+'" ×'+a.length).join(', ')
+        +'. '+(sing==='producto'
+          ? 'Revísalos a mano: como cada uno tiene su precio, unirlos es decisión tuya.'
+          : 'Su plata está partida en cuentas separadas. Unirlos junta todo en una sola ficha SIN borrar nada.'),
+      monto:0});
+  });
   const corridas=fechasCorridas();
   if(corridas.length) problemas.push({clave:'fechasCorridas', n:corridas.length,
     boton:'Corregir fechas',
@@ -1775,7 +1817,9 @@ function vForm(){
   }
   if(t==='abono'){
     const a=S.ctx.abono||{};
-    const quien = a.modo==='pago' ? ((DB.deudas.find(x=>x.id===a.did)||{}).acreedor||'') : cliente(a.cid).nombre;
+    const quien = a.modo==='pago'
+      ? (a.nombre || (DB.deudas.find(x=>x.id===a.did)||{}).acreedor || '')
+      : cliente(a.cid).nombre;
     const bt=(m,lb,ico)=>`<button class="mpick ${a.metodo===m?'on':''}" onclick="App.abonoMetodo('${m}')">
         <span class="mico">${ico}</span><b>${lb}</b></button>`;
     return `<div class="view-title">${a.modo==='pago'?'Pagar deuda':'Registrar abono'}</div>
@@ -1849,7 +1893,13 @@ function vForm(){
         <label class="fld"><span>¿A quién le debes?</span><select id="d_tipo" onchange="document.getElementById('d_gprov').style.display=this.value==='proveedor'?'block':'none';document.getElementById('d_gnom').style.display=this.value==='proveedor'?'none':'block'">
           <option value="proveedor">A un proveedor</option><option value="persona">A una persona u otro</option></select></label>
         <div id="d_gprov"><label class="fld"><span>Proveedor</span><select id="d_prov">${(DB.proveedores||[]).map(p=>`<option value="${p.id}">${p.nombre}</option>`).join('')||'<option value="">No tienes proveedores creados</option>'}</select></label></div>
-        <div id="d_gnom" style="display:none"><label class="fld"><span>Nombre</span><input type="text" id="d_nom" placeholder="Ej. Don Pedro, el banco, mi hermana"></label></div>
+        <div id="d_gnom" style="display:none"><label class="fld"><span>Nombre</span>
+          <input type="text" id="d_nom" list="d_nombres" autocomplete="off" placeholder="Ej. Don Pedro, el banco, mi hermana">
+          <datalist id="d_nombres">${[...new Map((DB.deudas||[])
+            .filter(x=>!x.proveedorId && x.acreedor)
+            .map(x=>[normNombre(x.acreedor), String(x.acreedor).trim()])).values()]
+            .sort().map(n=>`<option value="${n.replace(/"/g,'&quot;')}"></option>`).join('')}</datalist></label>
+          <div class="hint" style="margin:-8px 0 14px">Si ya le has anotado deudas a esa persona, escoge el nombre de la lista para que todo le quede en la misma cuenta.</div></div>
         <label class="fld"><span>¿Por qué es la deuda?</span><input type="text" id="d_conc" placeholder="Ej. Mercancía, préstamo, arriendo"></label>
         <label class="fld"><span>¿Cuánto debes?</span><input type="number" min="1" inputmode="numeric" id="d_monto" placeholder="0"></label>
         <label class="fld"><span>Desde cuándo</span><input type="date" id="d_fecha" value="${today()}"></label>
@@ -2327,6 +2377,37 @@ function topeAbono(a){
   return Math.max(0,(a.deuda||0)-retornosQueCaben(a).valor);
 }
 const saldoDeuda = d => Math.max(0, d.monto - (d.abonos||[]).reduce((s,a)=>s+montoAbono(a),0));
+/* Todas las facturas del mismo proveedor forman UNA cuenta, igual que los
+   fiados de un cliente. La llave es el proveedor si está enlazado; si no, el
+   nombre escrito (sin distinguir mayúsculas ni espacios de sobra). */
+/* El nombre se escribe a mano, así que "Efraín", "EFRAIN" y "efraín " tienen
+   que caer en la MISMA cuenta: se quitan tildes, mayúsculas y espacios de más. */
+const normNombre = t => String(t||'')
+  .normalize('NFD').replace(/[\u0300-\u036f]/g,'')   /* fuera tildes */
+  .toLowerCase().replace(/[^a-z0-9ñ ]+/g,' ')          /* fuera puntuación */
+  .replace(/\s+/g,' ').trim();
+/* Busca en una lista alguien que ya se llame igual (ignorando tildes y
+   mayúsculas). Es lo que evita tener dos "Efraín" con la plata partida. */
+function yaExisteNombre(lista, nombre, idActual){
+  const n=normNombre(nombre);
+  if(!n) return null;
+  return (lista||[]).find(x=>x && x.id!==idActual && normNombre(x.nombre)===n) || null;
+}
+function avisoRepetido(que, existente, nombre){
+  return confirm('YA TIENES '+que.toUpperCase()+' CON ESE NOMBRE\n\n'
+    +'Ya existe: "'+existente.nombre+'"\n'
+    +'Estás creando: "'+nombre+'"\n\n'
+    +'Si es la misma, toca Cancelar y usa la que ya está — así la plata no se '
+    +'te parte en dos cuentas.\n\n'
+    +'Si de verdad es otra persona distinta, acepta. Te recomiendo ponerle el '
+    +'apellido o algo que las diferencie.');
+}
+const llaveAcreedor = d => (d.proveedorId && String(d.proveedorId).trim())
+  || ('n:'+normNombre(d.acreedor));
+const deudasDe = k => (DB.deudas||[])
+  .filter(d=>d.estado!=='pagada' && saldoDeuda(d)>0 && llaveAcreedor(d)===k)
+  .sort((a,b)=> a.fecha===b.fecha ? ((a.ts||0)-(b.ts||0)) : (a.fecha<b.fecha?-1:1));
+const saldoAcreedor = k => deudasDe(k).reduce((t,d)=>t+saldoDeuda(d),0);
 const saldoDeudasTotal = () => (DB.deudas||[]).filter(d=>d.estado!=='pagada').reduce((t,d)=>t+saldoDeuda(d),0);
 
 /* -------------------------------- AJUSTES -------------------------------- */
@@ -2386,30 +2467,51 @@ function vDeudas(){
   const abiertas=(DB.deudas||[]).filter(d=>d.estado!=='pagada');
   const pagadas =(DB.deudas||[]).filter(d=>d.estado==='pagada');
   const total=saldoDeudasTotal();
-  const fila=d=>{
-    const sal=saldoDeuda(d), pag=d.monto-sal, pct=d.monto?Math.round(pag*100/d.monto):0;
-    return `<div class="card" style="padding:16px">
-      <div class="row" style="border:none;padding:0">
-        <div style="min-width:0"><div class="lab">${d.acreedor}</div>
-        <div class="sub">${d.concepto?d.concepto+' · ':''}${fmtFecha(d.fecha)}</div></div>
-        <div class="val" style="color:var(--coral);font-size:16px">${$(sal)}</div>
-      </div>
-      <div class="dprog"><i style="width:${pct}%"></i></div>
-      <div class="sub" style="margin-bottom:12px">Has pagado ${$(pag)} de ${$(d.monto)}${pct?` · ${pct}%`:''}</div>
-      <div style="display:flex;gap:8px">
-        <button class="btn btn-verde btn-sm" style="flex:1" onclick="App.pagarDeuda('${d.id}')">Abonar</button>
-        <button class="btn btn-ghost btn-sm" style="width:auto" onclick="App.delDeuda('${d.id}')">${svg('trash')}</button>
-      </div>
-    </div>`;
-  };
+  /* Una tarjeta por ACREEDOR con todas sus facturas adentro, igual que Te deben */
+  const porAcr={};
+  abiertas.forEach(d=>{ const k=llaveAcreedor(d); (porAcr[k]=porAcr[k]||[]).push(d); });
+  const bloques=Object.entries(porAcr)
+    .sort((a,b)=> b[1].reduce((t,d)=>t+saldoDeuda(d),0) - a[1].reduce((t,d)=>t+saldoDeuda(d),0))
+    .map(([k,arr])=>{
+      const orden=arr.slice().sort((a,b)=> a.fecha===b.fecha?((a.ts||0)-(b.ts||0)):(a.fecha<b.fecha?-1:1));
+      const saldo=orden.reduce((t,d)=>t+saldoDeuda(d),0);
+      const original=orden.reduce((t,d)=>t+(d.monto||0),0);
+      const pagado=original-saldo, pct=original?Math.round(pagado*100/original):0;
+      const dias=diasDesde(orden[0].fecha);
+      /* Si lo escribió de varias formas, se muestra la versión más larga */
+      const nombre=orden.map(d=>String(d.acreedor||'').trim())
+        .sort((a,b)=>b.length-a.length)[0] || orden[0].acreedor;
+      return `<div class="card" style="padding:16px">
+        <div class="row" style="border:none;padding:0 0 10px">
+          <div style="min-width:0"><div class="lab">${nombre}</div>
+          <div class="sub">${orden.length===1 ? `1 factura · hace ${dias} día${dias===1?'':'s'}`
+            : `${orden.length} facturas · la más vieja hace ${dias} día${dias===1?'':'s'}`}</div></div>
+          <div class="val" style="color:var(--coral);font-size:17px">${$(saldo)}</div>
+        </div>
+        ${pagado>0?`<div class="dprog"><i style="width:${pct}%"></i></div>
+        <div class="sub" style="margin-bottom:12px">Has pagado ${$(pagado)} de ${$(original)} · ${pct}%</div>`:'<div style="height:4px"></div>'}
+        <button class="btn btn-verde" onclick="App.pagarAcreedor('${k}')">Registrar un pago</button>
+        ${orden.length>1?'<div class="hint" style="margin:8px 0 12px">Se descuenta empezando por la factura más vieja.</div>':'<div style="height:12px"></div>'}
+        ${orden.length>1?'<div class="seclabel" style="margin:0 0 6px">Sus facturas, una por una</div>':''}
+        ${orden.map(d=>`<div class="row"><div style="min-width:0">
+          <div class="sub">${fmtFecha(d.fecha)} · ${d.concepto||'Factura'}</div>
+          ${(d.abonos||[]).length?`<div class="sub" style="color:var(--verde)">abonado ${$((d.abonos||[]).reduce((t,a)=>t+montoAbono(a),0))} de ${$(d.monto)}</div>`:''}</div>
+          <div style="display:flex;gap:8px;align-items:center;flex:none">
+            <span class="val">${$(saldoDeuda(d))}</span>
+            <button class="btn btn-sm btn-line" style="width:auto" onclick="App.pagarDeuda('${d.id}')">Solo esta</button>
+            <button class="btn btn-ghost btn-sm" style="width:auto" onclick="App.delDeuda('${d.id}')">${svg('trash')}</button>
+          </div></div>`).join('')}
+      </div>`;
+    });
   return `<div class="view-title">Tú debes</div>
     <div class="view-sub">Lo que tu negocio le debe a proveedores y a otras personas. Solo tú lo ves.</div>
     <div class="balcard azul"><div class="baltop"><span>Tú debes en total</span><b style="color:${total?'var(--coral)':'var(--verde)'}">${$(total)}</b></div>
-      <div class="row" style="border:none;padding:12px 0 14px"><div class="sub">${abiertas.length?abiertas.length+' deuda'+(abiertas.length===1?'':'s')+' pendiente'+(abiertas.length===1?'':'s'):'Estás al día'}</div></div>
+      <div class="row" style="border:none;padding:12px 0 14px"><div class="sub">${abiertas.length?(()=>{const n=new Set(abiertas.map(llaveAcreedor)).size;
+        return n+(n===1?' acreedor':' acreedores')+' · '+abiertas.length+' factura'+(abiertas.length===1?'':'s');})():'Estás al día'}</div></div>
     </div>
     <button class="btn btn-primary" onclick="App.form('deuda')">+ Anotar algo que debes</button>
     <div style="height:16px"></div>
-    ${abiertas.length?abiertas.map(fila).join(''):`<div class="empty">${svg('empty')}<div>No debes nada. Así da gusto.</div></div>`}
+    ${bloques.length?bloques.join(''):`<div class="empty">${svg('empty')}<div>No debes nada. Así da gusto.</div></div>`}
     ${pagadas.length?`<div class="seclabel">Pagadas</div>${pagadas.map(d=>`<div class="row"><div><div class="lab" style="text-decoration:line-through;color:var(--ink-soft)">${d.acreedor}</div><div class="sub">${d.concepto||''}</div></div><span class="pill v">Pagada · ${$(d.monto)}</span></div>`).join('')}`:''}`;
 }
 function vAjustes(){
@@ -2762,6 +2864,21 @@ const App = {
 
   /* Reparte UN abono entre todas las deudas del cliente, empezando por la más vieja.
      Cada deuda recibe su parte con el mismo n.º de recibo, así queda auditable. */
+  repartirPagoDeuda(k, monto, datos){
+    const abiertas=deudasDe(k);
+    let resta=monto; const aplicado=[];
+    for(const d of abiertas){
+      if(resta<1) break;
+      const sal=saldoDeuda(d), parte=Math.min(resta, sal);
+      d.abonos=d.abonos||[];
+      d.abonos.push(Object.assign({id:uid(),monto:parte},datos));
+      if(saldoDeuda(d)<1) d.estado='pagada';
+      aplicado.push({deudaId:d.id, detalle:(d.concepto||'Factura'), fecha:d.fecha,
+        parte, saldaba:sal, quedo:saldoDeuda(d)});
+      resta-=parte;
+    }
+    return {aplicado, sobra:resta};
+  },
   repartirAbono(cid, monto, datos){
     const abiertas=DB.fiados.filter(f=>f.clienteId===cid && f.estado!=='pagado' && saldoFiado(f)>0)
       .sort((a,b)=> a.fecha===b.fecha ? ((a.ts||0)-(b.ts||0)) : (a.fecha<b.fecha?-1:1));
@@ -2857,6 +2974,13 @@ const App = {
     const deuda=saldoFiado(f);
     if(deuda<1){ toast('Esa deuda ya está saldada'); return; }
     S.ctx={abono:{modo:'cobro', cid:f.clienteId, fid, deuda, metodo:'efectivo'}};
+    S.view='form'; S.sub='abono'; render(); window.scrollTo(0,0);
+  },
+  pagarAcreedor(k){
+    const arr=deudasDe(k);
+    if(!arr.length){ toast('No le debes nada'); return; }
+    const deuda=arr.reduce((t,d)=>t+saldoDeuda(d),0);
+    S.ctx={abono:{modo:'pago', acr:k, nombre:arr[0].acreedor, deuda, metodo:'efectivo'}};
     S.view='form'; S.sub='abono'; render(); window.scrollTo(0,0);
   },
   pagarDeuda(did){
@@ -2964,20 +3088,34 @@ const App = {
       usuarioId:S.user?S.user.id:'', usuario:S.user?S.user.nombre:''};
 
     if(a.modo==='pago'){
-      const d=DB.deudas.find(x=>x.id===a.did); if(!d) return;
-      d.abonos=d.abonos||[];
-      d.abonos.push(Object.assign({id:uid(),monto},base));
-      if(saldoDeuda(d)<1) d.estado='pagada';
-      DB.pagos.unshift({id:uid(), recibo:'', clienteId:'', cliente:d.acreedor,
+      let nombre, aplicado, restante;
+      if(a.acr){
+        /* Pago al capital: se reparte entre las facturas, de la más vieja a la más nueva */
+        const arr=deudasDe(a.acr);
+        if(!arr.length){ toast('No le debes nada'); return; }
+        nombre=arr[0].acreedor;
+        aplicado=this.repartirPagoDeuda(a.acr, monto, base).aplicado
+          .map(x=>({fecha:x.fecha, detalle:'Le pagaste · '+x.detalle, parte:x.parte, quedo:x.quedo}));
+        restante=saldoAcreedor(a.acr);
+      } else {
+        const d=DB.deudas.find(x=>x.id===a.did); if(!d) return;
+        nombre=d.acreedor;
+        d.abonos=d.abonos||[];
+        d.abonos.push(Object.assign({id:uid(),monto},base));
+        if(saldoDeuda(d)<1) d.estado='pagada';
+        aplicado=[{fecha:d.fecha, detalle:'Le pagaste · '+(d.concepto||'deuda'), parte:monto, quedo:saldoDeuda(d)}];
+        restante=saldoDeuda(d);
+      }
+      DB.pagos.unshift({id:uid(), recibo:'', clienteId:'', cliente:nombre,
         tipo:'pago-propio', fecha:base.fecha, ts:base.ts, usuario:base.usuario,
         metodo:a.metodo, referencia, comprobante,
         plata:monto, devuelto:0, cubierto:monto,
-        deudaAntes:a.deuda, saldoDespues:saldoDeuda(d),
-        fiados:[{fecha:d.fecha, detalle:'Le pagaste · '+(d.concepto||'deuda'), parte:monto, quedo:saldoDeuda(d)}],
-        devoluciones:[]});
+        deudaAntes:a.deuda, saldoDespues:restante,
+        fiados:aplicado, devoluciones:[]});
       DB.pagos=DB.pagos.slice(0,400);
       S.ctx={}; await persist(); App.irA('deudas');
-      toast(d.estado==='pagada'?'¡Deuda saldada!':'Pago anotado — debes '+$(saldoDeuda(d)));
+      toast(restante<1 ? '¡Quedaste a paz y salvo con '+nombre+'!'
+                       : 'Pago anotado — le debes '+$(restante));
       return;
     }
 
@@ -3074,6 +3212,34 @@ const App = {
   },
   async limpiarBasura(clave){
     const p=revisarDatos().find(x=>x.clave===clave); if(!p) return;
+    if(clave.indexOf('dup-')===0){
+      const sing=clave.slice(4);
+      const lista = sing==='cliente'?DB.clientes : sing==='proveedor'?DB.proveedores : DB.productos;
+      const dups=nombresDuplicados(lista);
+      if(!dups.length){ toast('Ya no hay repetidos'); return; }
+      if(sing==='producto'){
+        alert('PRODUCTOS REPETIDOS\n\n'+dups.map(a=>'· '+a[0].nombre+' ('+a.length+' veces)').join('\n')
+          +'\n\nCada producto tiene su propio precio y costo, así que unirlos podría cambiar tus cuentas.\n'
+          +'Entra a Productos, revisa cuál dejas y esconde el otro.');
+        return;
+      }
+      const g=dups[0];
+      /* Se queda el que tenga más movimiento; si empatan, el de nombre más largo */
+      const peso=x=> sing==='cliente'
+        ? (DB.fiados||[]).filter(f=>f.clienteId===x.id).length
+        : (DB.deudas||[]).filter(d=>d.proveedorId===x.id).length;
+      const orden=g.slice().sort((a,b)=> peso(b)-peso(a) || String(b.nombre).length-String(a.nombre).length);
+      const bueno=orden[0], viejos=orden.slice(1);
+      if(!confirm('UNIR '+sing.toUpperCase()+'S REPETIDOS\n\n'
+        +'Se van a juntar en una sola ficha:\n'
+        +g.map(x=>'· '+x.nombre).join('\n')+'\n\n'
+        +'Queda: "'+bueno.nombre+'"\n\n'
+        +'NO se borra ni un peso: todas las ventas, fiados y pagos pasan a esa ficha.\n'
+        +'Se guarda una copia de seguridad antes.\n\n¿Seguro?')) return;
+      const n=await unirFichas(sing, bueno.id, viejos.map(x=>x.id));
+      render(); toast('Listo — '+n+' registro(s) quedaron en "'+bueno.nombre+'"');
+      return;
+    }
     if(clave==='fechasCorridas'){
       if(!confirm('CORREGIR LAS FECHAS\n\n'+p.detalle+'\n\n'
         +'No se borra nada: los registros se mueven al día en que de verdad se anotaron.\n'
@@ -3490,6 +3656,8 @@ const App = {
     const rc=usaInsumos()?costoReceta({receta}):null;
     const costo=rc!=null?Math.round(rc):(parseInt(document.getElementById('p_cos').value)||0);
     if(!nombre){ toast('Ponle nombre al producto'); return; }
+    const repP=yaExisteNombre(DB.productos, nombre, id);
+    if(repP && !avisoRepetido('un producto', repP, nombre)) return;
     if(menudeo<1){ toast('El precio de menudeo es obligatorio'); return; }
     if(id) Object.assign(prod(id),{nombre,unidad,umbral,menudeo,mayoreo,costo,receta});
     else DB.productos.push({id:uid(),nombre,unidad,umbral,menudeo,mayoreo,costo,receta,activo:true});
@@ -3533,6 +3701,8 @@ const App = {
     const nombre=document.getElementById('v_nom').value.trim();
     const contacto=document.getElementById('v_con').value.trim();
     if(!nombre){ toast('Ponle nombre al proveedor'); return; }
+    const rep=yaExisteNombre(DB.proveedores, nombre, id);
+    if(rep && !avisoRepetido('un proveedor', rep, nombre)) return;
     if(id) Object.assign(proveedor(id),{nombre,contacto});
     else DB.proveedores.push({id:uid(),nombre,contacto});
     await persist(); App.volverAjustes('prov'); toast('Proveedor guardado');
@@ -3717,6 +3887,8 @@ const App = {
     const nombre=document.getElementById('c_nom').value.trim();
     const contacto=document.getElementById('c_con').value.trim();
     if(!nombre){ toast('Ponle nombre al cliente'); return; }
+    const rep=yaExisteNombre(DB.clientes, nombre, id);
+    if(rep && !avisoRepetido('un cliente', rep, nombre)) return;
     if(id) Object.assign(cliente(id),{nombre,contacto});
     else DB.clientes.push({id:uid(),nombre,contacto});
     await persist(); App.volverAjustes('cli'); toast('Cliente guardado');
@@ -3739,7 +3911,7 @@ document.addEventListener('input',e=>{ if(e.target.id==='f_precio') e.target.dat
    3) Anti-retroceso de reloj: DB.licencia.maxDate.
    Acceso al panel oculto: toca el logo (login/bloqueo) o la marca de arriba
    5 veces y entra con el PIN de creador (DB.creatorPin, por defecto 2468). */
-const APP_VER = 'v43';
+const APP_VER = 'v46';
 const GRACIA_DIAS = 7;
 /* Cuenta de soporte del creador. No vive en DB.usuarios: el cliente no la ve,
    no la puede editar ni borrar, y sobrevive aunque cambie todas las claves.

@@ -8,7 +8,7 @@
    clientes seguirán viendo la app vieja.
    =========================================================== */
 
-const VERSION = 'nexbit-v43';
+const VERSION = 'nexbit-v46';
 const SHELL   = VERSION + '-shell';   // la app
 const EXTERNO = VERSION + '-externo'; // fuentes y librerías
 
